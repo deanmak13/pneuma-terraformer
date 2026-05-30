@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local state — Terraform exec scratch (the runner uses /var/lib/terraformer/workspaces inside the container)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
