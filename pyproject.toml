@@ -16,19 +16,23 @@ dependencies = [
     "grpcio>=1.66,<2.0",
     "grpcio-tools>=1.66,<2.0",
     "protobuf>=5.27,<6.0",
-    # pneuma-proto is published from pneuma-proto repo; the optional
-    # proto_capability_sync path in main.py imports the provisioning
-    # pb2 from here. If it's not installed in a given env the import
-    # gracefully fails into "service starts without capability
-    # registration" mode — operator must seed the capability row
-    # manually in that env.
-    "pneuma-proto>=0.18.0,<1.0",
 ]
 
-# `services.common.db.client` + `services.common.proto_capability_sync`
-# are optional runtime imports (try/except ImportError in main.py); they
-# come from the (yet-to-be-published) pneuma-common library. When it
-# ships, add it here as a hard dep + drop the try/except fallback.
+# Two import paths in services/terraformer/src/main.py are wrapped in
+# try/except ImportError and the service starts (degraded — no
+# capability auto-registration) if either is absent:
+#
+#   - `pneuma_proto.v1.provisioning.provisioning_api_pb2` — published only
+#     as a GHCR wheels image (`ghcr.io/deanmak13/pneuma-proto:latest`),
+#     NOT to PyPI. The engine's Dockerfile pulls it via docker-cp from
+#     that image. When this repo's Dockerfile gains the same step (or
+#     pneuma-proto starts publishing to PyPI), add `pneuma-proto>=0.18`
+#     as a hard dep here. Until then, the lifespan logs and continues.
+#
+#   - `services.common.db.client` + `services.common.proto_capability_sync`
+#     — come from the (yet-to-be-published) `pneuma-common` library being
+#     extracted under Onboard-08 PR1. Add as a hard dep when it ships,
+#     drop the try/except fallback in main.py at the same time.
 
 [project.optional-dependencies]
 dev = [
