@@ -1,30 +1,47 @@
 # syntax=docker/dockerfile:1.6
 #
-# pneuma-terraformer — privileged FastAPI service that executes terraform
-# CLI against the per-tenant module to apply / destroy tenant resources.
+# pneuma-terraformer — privileged FastAPI service that shells out to the
+# `terraform` CLI against the per-tenant Terraform module.
 #
-# Image:    ghcr.io/deanmak13/pneuma-terraformer
-# Source:   pneuma-engine/services/terraformer/Dockerfile
-# Consumed by: pneuma-helm-charts/charts/pneuma-terraformer/
+# Image:        ghcr.io/deanmak13/pneuma-terraformer
+# Origin:       pneuma-engine/services/terraformer/ (pre-relocation,
+#               2026-05-31, see pneuma#301)
+# Consumed by:  pneuma-helm-charts/charts/pneuma-terraformer/
+# Deployed via: pneuma-deployments/platform/overlays/<env>/pneuma-terraformer/
 #
-# Capability surface: provisioning.apply_tenant_resources /
-# provisioning.destroy_tenant_resources / provisioning.read_tenant_state.
-# Dispatched by `core:tenant_apply_resources` cycle (Workstream A #1).
+# Capability surface (proto-served):
+#   - provisioning.apply_tenant_resources
+#   - provisioning.destroy_tenant_resources
+#   - provisioning.read_tenant_state
 #
-# The tenant Terraform module is baked into the image at
-# /app/infrastructure/terraform/modules/tenant/ — copied from the
-# pneuma-deployments submodule at build time. State backend is S3-
-# compatible (MinIO) configured at runtime via env vars.
+# Dispatched as cycle steps from `core:tenant_apply_resources` /
+# `core:tenant_destroy_resources` in pneuma-engine. The destroy path is
+# gated by the cycle-executor pre-run validator chain (PR 4 + 6 of the
+# cycle-prerun plan) — never invoke directly.
+#
+# Tenant TF module: NOT baked into the image. Mounted at runtime by the
+# helm chart from a sidecar / init-container at
+# /app/infrastructure/terraform/modules/tenant/. Keeps the image
+# vendor-agnostic so a module-shape change does not require a rebuild.
 
 # ---- Terraform binary ----
 FROM hashicorp/terraform:1.9 AS tf
 
 # ---- Builder stage ----
-FROM ghcr.io/deanmak13/pneuma-builder:latest AS builder
+# Resolves the pyproject.toml deps into a venv. `services.common.*` and
+# `pneuma_proto` are OPTIONAL imports — main.py's _sync_capabilities is
+# wrapped in try/except ImportError and the service starts (degraded,
+# without capability auto-registration) if either is absent. Once
+# `pneuma-common` (Onboard-08 PR1) publishes, the dep can be added here
+# and the fallback removed.
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+RUN pip install --no-cache-dir --upgrade pip wheel build
+
 COPY pyproject.toml ./
-COPY services/common/ ./services/common/
-COPY services/terraformer/src/ ./services/terraformer/src/
-RUN --mount=type=cache,target=/root/.cache/uv pip-install.sh
+COPY services/ ./services/
+RUN pip install --no-cache-dir --prefix=/install .
 
 # ---- Runtime stage ----
 FROM python:3.12-slim
@@ -38,19 +55,16 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+# Resolved site-packages from builder.
+COPY --from=builder /install/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /install/bin /usr/local/bin
+
+# Terraform binary.
 COPY --from=tf      /bin/terraform /usr/local/bin/terraform
 
-COPY services/common/ ./services/common/
-COPY services/terraformer/src/ ./services/terraformer/src/
-
-# The tenant TF module is sourced from the pneuma-deployments submodule
-# at build time. The build context MUST include
-# pneuma-deployments/infrastructure/terraform/modules/tenant/ — the CI
-# workflow checks out submodules: true to satisfy this.
-COPY pneuma-deployments/infrastructure/terraform/modules/tenant/ \
-     /app/infrastructure/terraform/modules/tenant/
+# Application source — same `services/terraformer/...` layout the engine
+# used pre-relocation, so the verbatim-copied imports still resolve.
+COPY services/ /app/services/
 
 USER appuser
 EXPOSE 8011

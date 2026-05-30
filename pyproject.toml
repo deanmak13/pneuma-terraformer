@@ -1,0 +1,87 @@
+[project]
+name = "pneuma-terraformer"
+version = "0.1.0"
+description = "Pneuma Terraform runner — declarative tenant-resource lifecycle"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Dean Mak", email = "dean.mak13@gmail.com" }]
+
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.5,<3.0",
+    "httpx>=0.27,<1.0",
+    "grpcio>=1.66,<2.0",
+    "grpcio-tools>=1.66,<2.0",
+    "protobuf>=5.27,<6.0",
+    # pneuma-proto is published from pneuma-proto repo; the optional
+    # proto_capability_sync path in main.py imports the provisioning
+    # pb2 from here. If it's not installed in a given env the import
+    # gracefully fails into "service starts without capability
+    # registration" mode — operator must seed the capability row
+    # manually in that env.
+    "pneuma-proto>=0.18.0,<1.0",
+]
+
+# `services.common.db.client` + `services.common.proto_capability_sync`
+# are optional runtime imports (try/except ImportError in main.py); they
+# come from the (yet-to-be-published) pneuma-common library. When it
+# ships, add it here as a hard dep + drop the try/except fallback.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    "pytest-cov>=5.0,<7.0",
+    "respx>=0.21,<1.0",
+    "ruff>=0.6,<1.0",
+    "mypy>=1.11,<2.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["services*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+source = ["services/terraformer"]
+omit = [
+    "services/__init__.py",
+    "services/terraformer/__init__.py",
+    "services/terraformer/src/__init__.py",
+    "services/terraformer/src/main.py",  # FastAPI app glue — exercised by integration tests, not unit
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "raise NotImplementedError",
+    "^\\s*pass\\s*$",
+    "from services\\.common",  # the optional-import fallback branch
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "ASYNC"]
+ignore = ["E501"]  # line-length handled by formatter
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true  # services.common.* + pneuma_proto.* deliberately optional

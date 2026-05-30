@@ -1,0 +1,60 @@
+name: Build and Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "pyproject.toml"
+      - "Dockerfile"
+      - ".github/workflows/build-and-publish.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: deanmak13
+  IMAGE_NAME: pneuma-terraformer
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: tags
+        env:
+          GH_SHA: ${{ github.sha }}
+        run: |
+          image="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+          short="${GH_SHA:0:7}"
+          echo "tags=${image}:latest,${image}:sha-${short}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${image}:latest, ${image}:sha-${short}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=terraformer
+          cache-to: type=gha,scope=terraformer,mode=max
