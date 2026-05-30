@@ -24,7 +24,18 @@ from services.terraformer.src.main import _sync_capabilities
 async def test_sync_invokes_proto_sync_with_terraformer_host_and_self_url() -> None:
     """Happy path: import succeeds, sync_capabilities_from_proto is
     called with host_service='terraformer' and webhook_url=settings.self_url.
+
+    Skipped in this standalone repo until `pneuma-common` (which ships
+    `services.common.db.client` + `services.common.proto_capability_sync`)
+    is a hard dep — `unittest.mock.patch` requires the target import to
+    resolve, and those modules are absent here by design. The companion
+    `test_sync_swallows_import_error_does_not_block_startup` test
+    covers the import-failure branch without needing the real module.
     """
+    pytest.importorskip(
+        "services.common",
+        reason="services.common ships with pneuma-common (Onboard-08 PR1) — not yet a dep here",
+    )
     from services.terraformer.src.settings import get_settings
 
     settings = get_settings()
@@ -91,7 +102,14 @@ async def test_sync_swallows_runtime_error_does_not_block_startup() -> None:
     """If the DB sync errors at runtime (DB down, schema not migrated,
     etc.), the helper logs.exception and returns. Service starts;
     operator sees the error and investigates without losing the pod.
+
+    Skipped in this standalone repo until pneuma-common is a hard dep
+    — same reason as the happy-path test above.
     """
+    pytest.importorskip(
+        "services.common",
+        reason="services.common ships with pneuma-common (Onboard-08 PR1) — not yet a dep here",
+    )
     from services.terraformer.src.settings import get_settings
 
     settings = get_settings()
