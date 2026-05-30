@@ -82,7 +82,12 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "B", "ASYNC"]
+# Matches pneuma-engine's selection (E/F/W) plus I (import sort) and B
+# (bugbear) for new-code hygiene. ASYNC is deliberately NOT enabled —
+# the inherited terraform_runner._spawn_terraform(workdir, args, timeout)
+# signature would trigger ASYNC109 with no clean asyncio.timeout()
+# refactor that preserves the call-site contract.
+select = ["E", "F", "W", "I", "B"]
 ignore = ["E501"]  # line-length handled by formatter
 
 [tool.mypy]

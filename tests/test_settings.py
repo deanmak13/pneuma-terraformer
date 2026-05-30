@@ -20,8 +20,9 @@ def test_settings_construct_from_env() -> None:
 
 def test_missing_required_secret_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HETZNER_API_TOKEN", raising=False)
-    from services.terraformer.src.settings import Settings
     from pydantic import ValidationError
+
+    from services.terraformer.src.settings import Settings
 
     with pytest.raises(ValidationError) as exc_info:
         Settings()
@@ -30,8 +31,9 @@ def test_missing_required_secret_raises(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_short_admin_key_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ADMIN_API_KEY", "short")
-    from services.terraformer.src.settings import Settings
     from pydantic import ValidationError
+
+    from services.terraformer.src.settings import Settings
 
     with pytest.raises(ValidationError):
         Settings()

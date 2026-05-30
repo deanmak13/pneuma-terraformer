@@ -297,8 +297,9 @@ async def test_spawn_redacts_backend_config_secrets_in_log(
     """`_spawn` MUST redact ``-backend-config secret_key=<v>`` /
     ``access_key=<v>`` pairs from its INFO log line. Pre-fix the log
     leaked MinIO admin creds on every init."""
-    from services.terraformer.src.settings import Settings
     import logging
+
+    from services.terraformer.src.settings import Settings
 
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",

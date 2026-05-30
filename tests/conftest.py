@@ -6,12 +6,10 @@ singletons can be constructed without crashing on missing required vars.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Iterator
 
 import pytest
-
 
 _REQUIRED_ENV = {
     "ENV": "tst",

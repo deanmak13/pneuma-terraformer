@@ -14,12 +14,10 @@ the demo-unblock surface and the long-term contract for capability dispatch.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field
-
-from typing import Literal
 
 from services.terraformer.src.auth import require_admin_key
 from services.terraformer.src.terraform_runner import (

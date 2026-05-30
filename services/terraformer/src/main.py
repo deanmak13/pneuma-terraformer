@@ -46,6 +46,7 @@ async def _sync_capabilities(settings) -> None:
     logger = logging.getLogger("terraformer.proto_sync")
     try:
         from pneuma_proto.v1.provisioning import provisioning_api_pb2
+
         from services.common.db.client import Database
         from services.common.proto_capability_sync import (
             sync_capabilities_from_proto,
