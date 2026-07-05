@@ -33,57 +33,42 @@ def _configure_logging() -> None:
 
 
 async def _sync_capabilities(settings) -> None:
-    """Auto-register terraformer's provisioning.* capabilities from the
-    proto descriptors. Mirrors the pattern used by brain / mimesis /
-    admin-api: every service that owns proto `option (capability) = {...}`
-    annotations calls `sync_capabilities_from_proto` at startup, which
-    upserts `public.capabilities` rows pointing the cycle-executor at
-    this pod's self_url. Without this, cycle dispatch of
-    `provisioning.apply_tenant_resources` / `.destroy_tenant_resources`
-    returns 'capability not found' because the implementation row never
-    appears in the DB.
-    """
+    """Auto-register Terraformer's provisioning.* gRPC capabilities."""
     logger = logging.getLogger("terraformer.proto_sync")
     try:
-        from pneuma_proto.v1.provisioning import provisioning_api_pb2
+        from pneuma_proto.provisioning.provisioning.v1 import provisioning_api_pb2
 
-        from services.common.db.client import Database
-        from services.common.proto_capability_sync import (
-            sync_capabilities_from_proto,
+        from services.terraformer.src.capability_sync import (
+            sync_provisioning_capabilities,
         )
     except ImportError:
         logger.exception(
             "terraformer proto_capability_sync IMPORT FAILED — "
-            "service will start without capability registration. "
-            "Check pneuma-proto wheel version + services.common path."
+            "refusing to start without provisioning capability registration."
         )
-        return
+        raise
 
     try:
-        db = Database.from_config(
+        result = await sync_provisioning_capabilities(
             base_url=settings.supabase_url,
             service_key=settings.supabase_service_key.get_secret_value(),
-        )
-        result = await sync_capabilities_from_proto(
-            db,
-            host_service="terraformer",
             file_descriptors=[provisioning_api_pb2.DESCRIPTOR],
-            webhook_url=settings.computed_self_url,
+            grpc_target=settings.computed_grpc_target,
         )
         logger.info(
             "terraformer proto_capability_sync complete: "
-            "upserted=%d soft_deleted=%d errors=%d webhook_url=%s",
-            result.get("capabilities_upserted", 0),
-            result.get("soft_deleted", 0),
-            len(result.get("errors", [])),
-            settings.computed_self_url,
+            "inserted=%d updated=%d total=%d grpc_target=%s",
+            result["inserted"],
+            result["updated"],
+            result["total"],
+            settings.computed_grpc_target,
         )
     except Exception:
         logger.exception(
-            "terraformer proto_capability_sync FAILED — service will start "
-            "but provisioning.* capabilities will NOT be dispatchable. "
-            "Operator must investigate before relying on cycle dispatch."
+            "terraformer proto_capability_sync FAILED — refusing to start "
+            "because provisioning.* capabilities would not be dispatchable."
         )
+        raise
 
 
 @asynccontextmanager
@@ -99,7 +84,13 @@ async def lifespan(app: FastAPI):
         settings.computed_self_url,
     )
     await _sync_capabilities(settings)
-    yield
+    from services.terraformer.src.grpc_server import start_grpc_server
+
+    grpc_server = await start_grpc_server(settings)
+    try:
+        yield
+    finally:
+        await grpc_server.stop(grace=5)
 
 
 app = FastAPI(

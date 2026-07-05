@@ -93,6 +93,7 @@ class Settings(BaseSettings):
         description="In-cluster namespace; used to derive self_url when not overridden.",
     )
     terraformer_port: int = 8011
+    grpc_port: int = 8012
     self_url: str = Field(
         default="",
         description=(
@@ -107,6 +108,10 @@ class Settings(BaseSettings):
         if self.self_url:
             return self.self_url
         return f"http://terraformer.{self.pneuma_namespace}.svc.cluster.local:{self.terraformer_port}"
+
+    @property
+    def computed_grpc_target(self) -> str:
+        return f"terraformer.{self.pneuma_namespace}.svc.cluster.local:{self.grpc_port}"
 
     @model_validator(mode="after")
     def _validate_enabled_provider_credentials(self) -> Settings:
