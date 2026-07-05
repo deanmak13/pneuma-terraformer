@@ -155,19 +155,26 @@ class TerraformRunner:
 
     def _tf_vars(self, inputs: TenantInputs) -> dict[str, str]:
         s = self._settings
-        return {
+        vars_ = {
             "tenant_id": inputs.tenant_id,
             "tenant_slug": inputs.tenant_slug,
             "env": inputs.env,
-            "compliance_profile": inputs.compliance_profile,
+            "profile": inputs.compliance_profile,
             "pooled_namespace": inputs.pooled_namespace,
-            "hetzner_api_token": s.hetzner_api_token,
-            "cloudflare_api_token": s.cloudflare_api_token,
             "postgres_superuser_password": s.postgres_superuser_password,
             "rabbitmq_admin_password": s.rabbitmq_admin_password,
             "minio_admin_password": s.minio_admin_password,
             "openbao_admin_token": s.openbao_admin_token,
         }
+        if s.tenant_infra_provider == "hetzner":
+            if not s.hetzner_api_token or not s.cloudflare_api_token:
+                raise ValueError(
+                    "TENANT_INFRA_PROVIDER=hetzner requires HETZNER_API_TOKEN "
+                    "and CLOUDFLARE_API_TOKEN"
+                )
+            vars_["hetzner_api_token"] = s.hetzner_api_token
+            vars_["cloudflare_api_token"] = s.cloudflare_api_token
+        return vars_
 
     async def _spawn(
         self,

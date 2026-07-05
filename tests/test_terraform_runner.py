@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.terraformer.src.settings import get_settings
+from services.terraformer.src.settings import Settings, get_settings
 from services.terraformer.src.terraform_runner import (
     TenantInputs,
     TerraformError,
@@ -46,8 +46,32 @@ async def test_tf_vars_carry_inputs_and_creds() -> None:
     assert vars_["tenant_id"] == "t-001"
     assert vars_["tenant_slug"] == "acme"
     assert vars_["pooled_namespace"] == "platform-tst"
-    assert vars_["hetzner_api_token"] == "x" * 40
+    assert vars_["profile"] == "standard"
+    assert "compliance_profile" not in vars_
+    assert "hetzner_api_token" not in vars_
+    assert "cloudflare_api_token" not in vars_
     assert vars_["postgres_superuser_password"] == "pg-pass-1234"
+
+
+@pytest.mark.asyncio
+async def test_tf_vars_include_provider_tokens_when_hetzner_enabled(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        tenant_infra_provider="hetzner",
+        hetzner_api_token="h" * 40,
+        cloudflare_api_token="c" * 40,
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    _seed_module(settings.terraform_modules_root)
+    runner = TerraformRunner(settings)
+
+    vars_ = runner._tf_vars(_stub_inputs())
+
+    assert vars_["hetzner_api_token"] == "h" * 40
+    assert vars_["cloudflare_api_token"] == "c" * 40
 
 
 @pytest.mark.asyncio
@@ -204,7 +228,7 @@ def test_scrub_credentials_redacts_known_secrets() -> None:
     from services.terraformer.src.terraform_runner import scrub_credentials
 
     settings = get_settings()
-    secret = settings.hetzner_api_token
+    secret = settings.openbao_admin_token
     leaky = f"Error: failed to provision: invalid token={secret} response=403"
     assert secret not in scrub_credentials(leaky, settings)
     assert "<REDACTED>" in scrub_credentials(leaky, settings)
@@ -252,8 +276,6 @@ async def test_state_returns_unbootstrapped_sentinel_without_init(
     """`state()` must NOT call _init() on an un-bootstrapped workspace.
     Read-path leaking admin tokens through a provider-error response
     was the pre-fix CRITICAL — guard against regression."""
-    from services.terraformer.src.settings import Settings
-
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
         terraform_modules_root=tmp_path / "modules",
@@ -276,8 +298,6 @@ async def test_state_returns_not_exists_for_missing_workspace(
 ) -> None:
     """If the workspace dir doesn't exist at all, state() returns the
     not-exists sentinel without trying to init/output."""
-    from services.terraformer.src.settings import Settings
-
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
         terraform_modules_root=tmp_path / "modules",
@@ -298,8 +318,6 @@ async def test_spawn_redacts_backend_config_secrets_in_log(
     ``access_key=<v>`` pairs from its INFO log line. Pre-fix the log
     leaked MinIO admin creds on every init."""
     import logging
-
-    from services.terraformer.src.settings import Settings
 
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
@@ -349,8 +367,6 @@ async def test_init_raises_terraform_error_on_nonzero(tmp_path: Path) -> None:
 async def test_reconcile_wipes_tfvars_on_success(tmp_path: Path) -> None:
     """`reconcile` MUST wipe terraform.auto.tfvars.json in the finally
     block so admin tokens don't persist on disk between runs."""
-    from services.terraformer.src.settings import Settings
-
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
         terraform_modules_root=tmp_path / "modules",
@@ -375,8 +391,6 @@ async def test_reconcile_wipes_tfvars_on_success(tmp_path: Path) -> None:
 async def test_reconcile_wipes_tfvars_on_apply_failure(tmp_path: Path) -> None:
     """Even when ``apply`` fails the tfvars file is still wiped. Pre-fix
     a failed apply would leave admin tokens on disk indefinitely."""
-    from services.terraformer.src.settings import Settings
-
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
         terraform_modules_root=tmp_path / "modules",
