@@ -18,21 +18,9 @@ dependencies = [
     "protobuf>=5.27,<6.0",
 ]
 
-# Two import paths in services/terraformer/src/main.py are wrapped in
-# try/except ImportError and the service starts (degraded — no
-# capability auto-registration) if either is absent:
-#
-#   - `pneuma_proto.v1.provisioning.provisioning_api_pb2` — published only
-#     as a GHCR wheels image (`ghcr.io/deanmak13/pneuma-proto:latest`),
-#     NOT to PyPI. The engine's Dockerfile pulls it via docker-cp from
-#     that image. When this repo's Dockerfile gains the same step (or
-#     pneuma-proto starts publishing to PyPI), add `pneuma-proto>=0.18`
-#     as a hard dep here. Until then, the lifespan logs and continues.
-#
-#   - `services.common.db.client` + `services.common.proto_capability_sync`
-#     — come from the (yet-to-be-published) `pneuma-common` library being
-#     extracted under Onboard-08 PR1. Add as a hard dep when it ships,
-#     drop the try/except fallback in main.py at the same time.
+# The Dockerfile installs the generated pneuma-proto wheel from
+# ghcr.io/deanmak13/pneuma-proto. It is not listed here because the wheel
+# is not published to PyPI.
 
 [project.optional-dependencies]
 dev = [

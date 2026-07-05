@@ -26,14 +26,13 @@
 
 # ---- Terraform binary ----
 FROM hashicorp/terraform:1.9 AS tf
+FROM ghcr.io/deanmak13/pneuma-proto:latest AS proto
 
 # ---- Builder stage ----
-# Resolves the pyproject.toml deps into a venv. `services.common.*` and
-# `pneuma_proto` are OPTIONAL imports — main.py's _sync_capabilities is
-# wrapped in try/except ImportError and the service starts (degraded,
-# without capability auto-registration) if either is absent. Once
-# `pneuma-common` (Onboard-08 PR1) publishes, the dep can be added here
-# and the fallback removed.
+# Resolves the pyproject.toml deps into a venv and installs the generated
+# pneuma-proto wheel copied from the GHCR wheel image. Capability
+# registration is fail-closed at startup; a Terraformer without proto stubs
+# is not a dispatchable Terraformer.
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
@@ -41,6 +40,8 @@ RUN pip install --no-cache-dir --upgrade pip wheel build
 
 COPY pyproject.toml ./
 COPY services/ ./services/
+COPY --from=proto /wheels /tmp/proto-wheels
+RUN pip install --no-cache-dir /tmp/proto-wheels/pneuma_proto-*.whl
 RUN pip install --no-cache-dir --prefix=/install .
 
 # ---- Runtime stage ----
