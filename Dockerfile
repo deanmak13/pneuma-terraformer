@@ -49,7 +49,8 @@ FROM python:3.12-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -m -d /var/lib/terraformer -s /bin/false appuser \
+    && groupadd --system --gid 65532 appuser \
+    && useradd --system --uid 65532 --gid 65532 -m -d /var/lib/terraformer -s /bin/false appuser \
     && mkdir -p /var/lib/terraformer/workspaces /app/infrastructure/terraform/modules \
     && chown -R appuser:appuser /var/lib/terraformer
 
@@ -66,7 +67,7 @@ COPY --from=tf      /bin/terraform /usr/local/bin/terraform
 # used pre-relocation, so the verbatim-copied imports still resolve.
 COPY services/ /app/services/
 
-USER appuser
+USER 65532:65532
 EXPOSE 8011
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
