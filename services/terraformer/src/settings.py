@@ -1,16 +1,18 @@
 """terraformer settings — env-driven Pydantic configuration.
 
 The service consumes admin credentials via ExternalSecret-mounted env vars
-(see pneuma-helm-charts/charts/pneuma-terraformer/secrets.schema.yaml). Every
-secret is REQUIRED — missing creds MUST crash the pod at startup per the
-no-optional-secrets LAW.
+(see pneuma-helm-charts/charts/pneuma-terraformer/secrets.schema.yaml).
+Credentials are required for the enabled provisioning surface. Provider
+credentials for inactive infrastructure backends stay optional so a Contabo /
+k3s cluster does not require unrelated Hetzner secrets at startup.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,8 +62,16 @@ class Settings(BaseSettings):
     tf_state_backend_access_key: str = Field(..., min_length=3)
     tf_state_backend_secret_key: str = Field(..., min_length=8)
 
-    hetzner_api_token: str = Field(..., min_length=32)
-    cloudflare_api_token: str = Field(..., min_length=32)
+    tenant_infra_provider: Literal["in_cluster", "hetzner"] = Field(
+        default="in_cluster",
+        description=(
+            "Tenant resource provider. in_cluster manages the current k3s "
+            "data-plane resources; hetzner additionally requires external "
+            "provider credentials."
+        ),
+    )
+    hetzner_api_token: str | None = Field(default=None, min_length=32)
+    cloudflare_api_token: str | None = Field(default=None, min_length=32)
     postgres_superuser_password: str = Field(..., min_length=8)
     rabbitmq_admin_password: str = Field(..., min_length=8)
     minio_admin_password: str = Field(..., min_length=8)
@@ -97,6 +107,22 @@ class Settings(BaseSettings):
         if self.self_url:
             return self.self_url
         return f"http://terraformer.{self.pneuma_namespace}.svc.cluster.local:{self.terraformer_port}"
+
+    @model_validator(mode="after")
+    def _validate_enabled_provider_credentials(self) -> Settings:
+        if self.tenant_infra_provider != "hetzner":
+            return self
+        missing = [
+            name
+            for name in ("HETZNER_API_TOKEN", "CLOUDFLARE_API_TOKEN")
+            if not getattr(self, name.lower())
+        ]
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(
+                f"TENANT_INFRA_PROVIDER=hetzner requires seeded {joined}"
+            )
+        return self
 
 
 _settings: Settings | None = None
