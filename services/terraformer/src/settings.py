@@ -51,6 +51,17 @@ class Settings(BaseSettings):
         default=Path("/app/infrastructure/terraform/standalone"),
         description="Root containing standalone Terraform harnesses (platform-secrets-apply/, etc.). Sibling of terraform_modules_root.",
     )
+    tf_cli_config_file: str = Field(
+        default="/app/tf/cli.tfrc",
+        description=(
+            "Path to the Terraform CLI config (tf/cli.tfrc, baked into the "
+            "image) that points provider installation at the filesystem "
+            "plugin mirror baked at /opt/tf-plugin-mirror — set as "
+            "TF_CLI_CONFIG_FILE on every terraform subprocess. A plain "
+            "string field (not Path) so tests can point it at a tmp_path "
+            "fixture without touching the real /app/tf/cli.tfrc."
+        ),
+    )
     platform_helm_charts_dir: Path = Field(
         default=Path("/charts"),
         description="Mount path of the pneuma-helm-charts checkout — read by the platform-secrets module's fileset() at plan time. Chart values mount this from a git-sync sidecar or read-only ConfigMap.",
