@@ -48,7 +48,11 @@ python_files = ["test_*.py"]
 addopts = "-ra --strict-markers"
 
 [tool.coverage.run]
-source = ["services/terraformer"]
+# Measure the top-level `services` package, not the `services/terraformer`
+# sub-path — pytest-cov mis-measures method bodies as NOT-MEASURED under
+# the sub-path form (false diff-cov failures). See
+# docs/plans/2026-07-11-terraformer-onboarding-provisioning.md §2.3.
+source = ["services"]
 omit = [
     "services/__init__.py",
     "services/terraformer/__init__.py",
