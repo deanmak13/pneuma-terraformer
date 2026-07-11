@@ -149,26 +149,30 @@ class TerraformRunner:
         return self._settings.terraform_modules_root / _TENANT_MODULE
 
     def _backend_config(self, tenant_id: str) -> dict[str, str]:
-        # Key names verified locally against hashicorp/terraform:1.9's S3
-        # backend (AWS SDK v2, in effect since TF 1.6): the legacy
-        # `endpoint` / `force_path_style` top-level arguments are
-        # deprecated in favour of the nested `endpoints.s3` object and
-        # `use_path_style` — passed here as a single -backend-config
-        # argument carrying an inline HCL object literal, since
-        # `-backend-config` does not accept dotted-path keys for nested
-        # attributes. Separately (and regardless of endpoint key naming),
-        # TF 1.9's S3 backend always attempts an AWS account-ID lookup
-        # unless `skip_requesting_account_id=true` is set — against a
-        # non-AWS S3-compatible endpoint (MinIO) that lookup 403s and
-        # init fails outright even with skip_credentials_validation=true.
+        # ONLY flat primitive (string/bool) attributes belong here —
+        # Terraform treats CLI `-backend-config k=v` VALUES as literal
+        # strings (cty.StringVal), never HCL, so an object-typed
+        # attribute like the S3 backend's nested `endpoints` CANNOT be
+        # set via CLI at all (hashicorp/terraform#34616, #36911): an
+        # inline `{s3="..."}` literal fails type conversion at init.
+        # The S3 endpoint therefore travels via AWS_ENDPOINT_URL_S3 on
+        # the subprocess env (see _spawn), which the AWS-SDK-v2-backed
+        # S3 backend (TF >= 1.6) reads as `endpoints.s3`. Credentials
+        # likewise stay env-only (AWS_ACCESS_KEY_ID /
+        # AWS_SECRET_ACCESS_KEY in _spawn) — never argv, where they'd
+        # be world-readable in /proc/<pid>/cmdline.
+        #
+        # Key semantics verified locally against hashicorp/terraform:1.9:
+        # the legacy `force_path_style` argument is deprecated in favour
+        # of `use_path_style`, and `skip_requesting_account_id=true` is
+        # required against a non-AWS S3-compatible endpoint (MinIO) —
+        # without it the backend's AWS account-ID lookup 403s and init
+        # fails outright even with skip_credentials_validation=true.
         s = self._settings
         return {
             "bucket": s.tf_state_backend_bucket,
             "key": f"tenants/{tenant_id}.tfstate",
             "region": s.tf_state_backend_region,
-            "endpoints": f'{{s3="{s.tf_state_backend_endpoint}"}}',
-            "access_key": s.tf_state_backend_access_key,
-            "secret_key": s.tf_state_backend_secret_key,
             "use_path_style": "true",
             "skip_credentials_validation": "true",
             "skip_region_validation": "true",
@@ -241,6 +245,13 @@ class TerraformRunner:
         env["TF_CLI_CONFIG_FILE"] = self._settings.tf_cli_config_file
         env["AWS_ACCESS_KEY_ID"] = self._settings.tf_state_backend_access_key
         env["AWS_SECRET_ACCESS_KEY"] = self._settings.tf_state_backend_secret_key
+        # The S3 backend's `endpoints.s3` attribute is object-typed and
+        # cannot be set via CLI -backend-config (values are literal
+        # strings, never HCL — hashicorp/terraform#34616, #36911). The
+        # AWS-SDK-v2-backed backend (TF >= 1.6) documents this env var as
+        # its equivalent source, so the MinIO endpoint travels env-only,
+        # exactly like the credentials above.
+        env["AWS_ENDPOINT_URL_S3"] = self._settings.tf_state_backend_endpoint
         # Provider-plugin credentials (Postgres/RMQ/MinIO/Vault/Kubernetes)
         # — env-only, never argv, so they never appear in a process
         # listing or the redacted argv log line above.
@@ -499,18 +510,18 @@ class TerraformRunner:
         return self._settings.terraform_standalone_root / "platform-secrets-apply"
 
     def _platform_secrets_backend_config(self, env: str) -> dict[str, str]:
-        # Same verified S3 backend-config key set as _backend_config()
-        # above — kept identical so the two workspaces (per-tenant,
+        # Same flat-primitives-only key set as _backend_config() above —
+        # kept identical so the two workspaces (per-tenant,
         # platform-secrets) never drift onto different-and-untested key
-        # shapes.
+        # shapes. Endpoint + credentials travel env-only via _spawn
+        # (AWS_ENDPOINT_URL_S3 / AWS_ACCESS_KEY_ID /
+        # AWS_SECRET_ACCESS_KEY) — see _backend_config's comment for why
+        # nested `endpoints` cannot be a CLI -backend-config argument.
         s = self._settings
         return {
             "bucket": s.tf_state_backend_bucket,
             "key": f"platform-secrets/{env}.tfstate",
             "region": s.tf_state_backend_region,
-            "endpoints": f'{{s3="{s.tf_state_backend_endpoint}"}}',
-            "access_key": s.tf_state_backend_access_key,
-            "secret_key": s.tf_state_backend_secret_key,
             "use_path_style": "true",
             "skip_credentials_validation": "true",
             "skip_region_validation": "true",

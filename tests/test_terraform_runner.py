@@ -442,36 +442,82 @@ async def test_output_json_parses_outputs(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_backend_config_uses_verified_s3_backend_keys_not_deprecated() -> None:
-    """gate-5 finding (verified locally against hashicorp/terraform:1.9):
-    the S3 backend deprecates top-level endpoint/force_path_style in
-    favour of endpoints.s3/use_path_style, and separately requires
-    skip_requesting_account_id=true against a non-AWS S3-compatible
-    endpoint (MinIO) or init fails outright with 'AWS account ID not
-    previously found' regardless of endpoint key naming."""
+def test_backend_config_is_flat_primitives_only_no_secrets_no_endpoints() -> None:
+    """Review findings 1+2 on the P3 PR: CLI -backend-config values are
+    literal strings (cty.StringVal), never HCL — the S3 backend's
+    object-typed `endpoints` attribute CANNOT be set via CLI (an inline
+    HCL literal fails type conversion at init; hashicorp/terraform#34616,
+    #36911), and access_key/secret_key in the dict would land in argv
+    (/proc/<pid>/cmdline-visible) while being strictly redundant with the
+    AWS_* env vars _spawn already exports. Both travel env-only now
+    (AWS_ENDPOINT_URL_S3 / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
+    The dict keeps only flat scalars — verified against terraform 1.9:
+    use_path_style (force_path_style is deprecated) and
+    skip_requesting_account_id=true (required against MinIO or the AWS
+    account-ID lookup 403s init outright)."""
     settings = get_settings()
     runner = TerraformRunner(settings)
 
     cfg = runner._backend_config("t-001")
+    assert "endpoints" not in cfg
     assert "endpoint" not in cfg
+    assert "access_key" not in cfg
+    assert "secret_key" not in cfg
     assert "force_path_style" not in cfg
-    assert cfg["endpoints"] == f'{{s3="{settings.tf_state_backend_endpoint}"}}'
+    assert cfg["bucket"] == settings.tf_state_backend_bucket
+    assert cfg["key"] == "tenants/t-001.tfstate"
+    assert cfg["region"] == settings.tf_state_backend_region
     assert cfg["use_path_style"] == "true"
+    assert cfg["skip_credentials_validation"] == "true"
     assert cfg["skip_requesting_account_id"] == "true"
 
 
-def test_platform_secrets_backend_config_uses_same_verified_s3_keys() -> None:
+def test_platform_secrets_backend_config_matches_tenant_key_shape() -> None:
     """The platform-secrets workspace's backend config must not drift
-    onto a different (untested) key shape than the tenant workspace."""
+    onto a different (untested) key shape than the tenant workspace —
+    same flat-primitives-only rule, same no-secrets/no-endpoints rule."""
     settings = get_settings()
     runner = TerraformRunner(settings)
 
     cfg = runner._platform_secrets_backend_config("tst")
+    assert "endpoints" not in cfg
     assert "endpoint" not in cfg
+    assert "access_key" not in cfg
+    assert "secret_key" not in cfg
     assert "force_path_style" not in cfg
-    assert cfg["endpoints"] == f'{{s3="{settings.tf_state_backend_endpoint}"}}'
+    assert cfg["key"] == "platform-secrets/tst.tfstate"
     assert cfg["use_path_style"] == "true"
     assert cfg["skip_requesting_account_id"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_init_argv_carries_no_secret_values(tmp_path: Path) -> None:
+    """Recurrence guard for review finding 2: no element of the argv
+    _init/_init_platform assemble (the -backend-config pairs) may contain
+    the state-backend secret key or access key — those travel env-only
+    via _spawn. If a future edit re-adds credentials to either backend
+    dict, this fails."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    captured_args: list[list[str]] = []
+    ok = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+
+    async def _fake_spawn(wd, args, timeout):  # noqa: ARG001
+        captured_args.append(args)
+        return ok
+
+    with patch.object(runner, "_spawn", AsyncMock(side_effect=_fake_spawn)):
+        await runner._init(workdir, "t-001")
+        await runner._init_platform(workdir, "tst")
+
+    assert len(captured_args) == 2, "expected _init AND _init_platform to spawn terraform"
+    for args in captured_args:
+        for arg in args:
+            assert settings.tf_state_backend_secret_key not in arg
+            assert settings.tf_state_backend_access_key not in arg
 
 
 @pytest.mark.asyncio
@@ -700,8 +746,11 @@ def test_provider_env_includes_kube_vars_only_when_sa_files_present(
 @pytest.mark.asyncio
 async def test_spawn_sets_tf_cli_config_file_and_provider_env(tmp_path: Path) -> None:
     """`_spawn` must set TF_CLI_CONFIG_FILE (wiring the baked provider
-    mirror) and merge _provider_env() onto the subprocess environment —
-    proves the wiring end-to-end without invoking real terraform."""
+    mirror), the S3 state-backend env trio (AWS_ENDPOINT_URL_S3 — the
+    only CLI-settable channel for the backend's object-typed
+    `endpoints.s3` attribute — plus the AWS credential pair), and merge
+    _provider_env() onto the subprocess environment — proves the wiring
+    end-to-end without invoking real terraform."""
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
         terraform_modules_root=tmp_path / "modules",
@@ -724,6 +773,9 @@ async def test_spawn_sets_tf_cli_config_file_and_provider_env(tmp_path: Path) ->
         await runner._spawn(workdir, ["--version"], timeout=5)
 
     assert captured_env["TF_CLI_CONFIG_FILE"] == str(tmp_path / "custom-cli.tfrc")
+    assert captured_env["AWS_ENDPOINT_URL_S3"] == settings.tf_state_backend_endpoint
+    assert captured_env["AWS_ACCESS_KEY_ID"] == settings.tf_state_backend_access_key
+    assert captured_env["AWS_SECRET_ACCESS_KEY"] == settings.tf_state_backend_secret_key
     assert captured_env["PGPASSWORD"] == settings.postgres_superuser_password
     assert captured_env["VAULT_TOKEN"] == settings.openbao_admin_token
 
