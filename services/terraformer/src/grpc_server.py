@@ -8,10 +8,12 @@ import time
 from typing import Any
 
 import grpc
+from pneuma_proto.provisioning.platform.v1 import platform_provisioning_api_pb2_grpc
 
 from services.terraformer.src.routes.provisioning import _TENANT_ID_PATTERN
 from services.terraformer.src.settings import Settings
 from services.terraformer.src.terraform_runner import (
+    PlatformBusTopologyInputs,
     TenantInputs,
     TerraformError,
     TerraformRunner,
@@ -168,6 +170,67 @@ class ProvisioningService:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
 
+class PlatformProvisioningService(platform_provisioning_api_pb2_grpc.PlatformProvisioningServiceServicer):
+    """gRPC servicer for `PlatformProvisioningService` (proto
+    `provisioning/platform/v1/platform_provisioning_api.proto`) — the
+    platform-tier sibling of `ProvisioningService` above. Both RPCs on
+    this service are env-scoped, NEVER tenant-scoped (see the proto's own
+    header comment: "Never mesh them" — D2 in plan §3.1). Registered as a
+    SEPARATE gRPC service on the same server (see start_grpc_server) so a
+    caller can never reach a platform-wide, ALL-tenants blast-radius
+    operation through the tenant-scoped ProvisioningService surface.
+
+    Unlike `ProvisioningService` above (a bare duck-typed class), this
+    class INHERITS the generated `PlatformProvisioningServiceServicer`
+    base. That's a deliberate, forced choice, not a style preference:
+    grpc's generated `add_PlatformProvisioningServiceServicer_to_server`
+    accesses `servicer.ApplyPlatformSecrets` directly when building its
+    method-handler map (see platform_provisioning_api_pb2_grpc.py) — a
+    bare class implementing only ApplyPlatformBusTopology would raise
+    AttributeError at server-start, taking down the whole gRPC server
+    (including the already-working tenant-tier RPCs) for a method this
+    PR was never scoped to build.
+
+    ApplyPlatformBusTopology (P5.2, this PR) is the only RPC implemented
+    here. ApplyPlatformSecrets falls through to the inherited base
+    method, which correctly answers UNIMPLEMENTED — despite this task's
+    brief describing it as "an existing, working ApplyPlatformSecrets
+    gRPC handler to mirror," no such handler exists anywhere in this
+    repo's history (verified against `git log --all` + the plan doc,
+    docs/plans/2026-07-11-terraformer-onboarding-provisioning.md P4.4:
+    that item only proto-registered + capability-registered
+    `apply_platform_secrets`, and the fully-tested runner-level method
+    `TerraformRunner.reconcile_platform_secrets` has only ever been
+    dispatched over HTTP via POST /provisioning/reconcile-platform-secrets
+    — see routes/provisioning.py). Building ApplyPlatformSecrets' gRPC
+    handler is a separate, not-yet-scoped follow-up; UNIMPLEMENTED is the
+    honest answer until then, not a silent gap."""
+
+    def __init__(self, settings: Settings, runner: TerraformRunner | None = None):
+        self._settings = settings
+        self._runner = runner or get_runner()
+
+    async def ApplyPlatformBusTopology(self, request, context):
+        pb2 = _platform_pb2()
+        started = time.monotonic()
+        try:
+            result = await self._runner.reconcile_platform_bus_topology(
+                PlatformBusTopologyInputs(env=request.env)
+            )
+            return pb2.ApplyPlatformBusTopologyResponse(
+                resources=_string_map(result.outputs),
+                duration_ms=int((time.monotonic() - started) * 1000),
+                runner_summary=_summary(result.stdout),
+                exit_code=result.exit_code,
+            )
+        except TerraformError as exc:
+            await context.abort(
+                _terraform_error_code(exc), scrub_credentials(str(exc), self._settings)
+            )
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+
+
 def _summary(stdout: str) -> str:
     for line in reversed((stdout or "").splitlines()):
         if line.strip():
@@ -181,12 +244,22 @@ def _pb2():
     return provisioning_api_pb2
 
 
+def _platform_pb2():
+    from pneuma_proto.provisioning.platform.v1 import platform_provisioning_api_pb2
+
+    return platform_provisioning_api_pb2
+
+
 async def start_grpc_server(settings: Settings, runner: TerraformRunner | None = None) -> grpc.aio.Server:
     from pneuma_proto.provisioning.provisioning.v1 import provisioning_api_pb2_grpc
 
     server = grpc.aio.server()
     provisioning_api_pb2_grpc.add_ProvisioningServiceServicer_to_server(
         ProvisioningService(settings, runner=runner),
+        server,
+    )
+    platform_provisioning_api_pb2_grpc.add_PlatformProvisioningServiceServicer_to_server(
+        PlatformProvisioningService(settings, runner=runner),
         server,
     )
     listen_addr = f"[::]:{settings.grpc_port}"

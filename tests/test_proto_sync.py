@@ -29,25 +29,33 @@ async def test_sync_invokes_proto_sync_with_terraformer_host_and_self_url() -> N
     The production image installs the generated pneuma-proto wheel from
     GHCR. The unit test supplies lightweight import shims so it does not
     depend on that image artifact being present locally.
+
+    file_descriptors carries BOTH the tenant-tier ProvisioningService
+    descriptor AND the platform-tier PlatformProvisioningService
+    descriptor (added P5.2) — asserts the exact two-descriptor list, in
+    order, so a future edit that drops one silently is caught here.
     """
     from services.terraformer.src.settings import get_settings
 
     settings = get_settings()
     fake_descriptor = MagicMock(name="provisioning_api_DESCRIPTOR")
+    fake_platform_descriptor = MagicMock(name="platform_provisioning_api_DESCRIPTOR")
     fake_sync = AsyncMock(
         return_value={
-            "inserted": 3,
+            "inserted": 5,
             "updated": 0,
-            "total": 3,
+            "total": 5,
         }
     )
 
     fake_proto_module = ModuleType("provisioning_api_pb2")
     fake_proto_module.DESCRIPTOR = fake_descriptor
+    fake_platform_module = ModuleType("platform_provisioning_api_pb2")
+    fake_platform_module.DESCRIPTOR = fake_platform_descriptor
     fake_sync_module = ModuleType("capability_sync")
     fake_sync_module.sync_provisioning_capabilities = fake_sync
 
-    with patch.dict("sys.modules", _proto_modules(fake_proto_module) | {
+    with patch.dict("sys.modules", _proto_modules(fake_proto_module, fake_platform_module) | {
         "services.terraformer.src.capability_sync": fake_sync_module,
     }):
         await _sync_capabilities(settings)
@@ -56,7 +64,7 @@ async def test_sync_invokes_proto_sync_with_terraformer_host_and_self_url() -> N
     assert fake_sync.await_args is not None
     call_kwargs = fake_sync.await_args.kwargs
     assert call_kwargs["grpc_target"] == settings.computed_grpc_target
-    assert call_kwargs["file_descriptors"] == [fake_descriptor]
+    assert call_kwargs["file_descriptors"] == [fake_descriptor, fake_platform_descriptor]
 
 
 @pytest.mark.asyncio
@@ -135,16 +143,34 @@ def test_computed_grpc_target_uses_namespace_and_grpc_port() -> None:
     assert s.computed_grpc_target == "terraformer.platform-tst.svc.cluster.local:8012"
 
 
-def _proto_modules(fake_proto_module: ModuleType) -> dict[str, ModuleType]:
+def _proto_modules(
+    fake_proto_module: ModuleType,
+    fake_platform_module: ModuleType | None = None,
+) -> dict[str, ModuleType]:
+    """Fake sys.modules entries for both the tenant-tier
+    (pneuma_proto.provisioning.provisioning.v1) and platform-tier
+    (pneuma_proto.provisioning.platform.v1, added P5.2) proto packages.
+    `fake_platform_module` defaults to `fake_proto_module` for tests that
+    don't care about distinguishing the two (e.g. the runtime-error
+    swallow path, which only needs _sync_capabilities to reach
+    sync_provisioning_capabilities)."""
+    platform_module = fake_platform_module if fake_platform_module is not None else fake_proto_module
+
     root = ModuleType("pneuma_proto")
     provisioning = ModuleType("pneuma_proto.provisioning")
     provisioning_segment = ModuleType("pneuma_proto.provisioning.provisioning")
     v1 = ModuleType("pneuma_proto.provisioning.provisioning.v1")
     v1.provisioning_api_pb2 = fake_proto_module
+    platform_segment = ModuleType("pneuma_proto.provisioning.platform")
+    platform_v1 = ModuleType("pneuma_proto.provisioning.platform.v1")
+    platform_v1.platform_provisioning_api_pb2 = platform_module
     return {
         "pneuma_proto": root,
         "pneuma_proto.provisioning": provisioning,
         "pneuma_proto.provisioning.provisioning": provisioning_segment,
         "pneuma_proto.provisioning.provisioning.v1": v1,
         "pneuma_proto.provisioning.provisioning.v1.provisioning_api_pb2": fake_proto_module,
+        "pneuma_proto.provisioning.platform": platform_segment,
+        "pneuma_proto.provisioning.platform.v1": platform_v1,
+        "pneuma_proto.provisioning.platform.v1.platform_provisioning_api_pb2": platform_module,
     }

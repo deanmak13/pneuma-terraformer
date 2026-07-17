@@ -2,14 +2,26 @@
 
 Pneuma's Terraform runner service — declarative tenant-resource lifecycle.
 
-**Capability surface**: `provisioning.apply_tenant_resources` /
-`provisioning.destroy_tenant_resources` / `provisioning.read_tenant_state`.
-Dispatched by the `core:tenant_apply_resources` / `core:tenant_destroy_resources`
-cycles in `pneuma-engine` over gRPC.
+**Capability surface**: tenant-tier `provisioning.apply_tenant_resources` /
+`provisioning.destroy_tenant_resources` / `provisioning.read_tenant_state`
+(dispatched by the `core:tenant_apply_resources` / `core:tenant_destroy_resources`
+cycles, gRPC `ProvisioningService`) plus platform-tier
+`provisioning.apply_platform_secrets` / `provisioning.apply_platform_bus_topology`
+(gRPC `PlatformProvisioningService`, a separate service — see
+`docs/standards/declarative-infra-via-terraform.md` §2.0 "never mesh
+tenant and platform tiers"). Dispatched by `core:platform_apply_secret_reconcile` /
+`core:platform_apply_bus_topology` in `pneuma-engine` — both cycles stay
+`status: "draft"` until their respective activation gates (P7.3) flip
+them. `ApplyPlatformBusTopology`'s handler is implemented and tested;
+`ApplyPlatformSecrets`' gRPC handler is NOT yet built (only proto- and
+capability-registered) — it currently answers UNIMPLEMENTED, still
+reachable only via the pre-existing `POST /provisioning/reconcile-platform-secrets`
+HTTP route.
 
 **Image**: `ghcr.io/deanmak13/pneuma-terraformer`
 **Port**: 8011 (HTTP — health + the `apply_platform_secrets` route) /
-8012 (gRPC — the three provisioning.* RPCs)
+8012 (gRPC — 3 tenant-tier `ProvisioningService` RPCs +
+2 platform-tier `PlatformProvisioningService` RPCs)
 **Consumed by**: `pneuma-helm-charts/charts/pneuma-terraformer/`
 **Deployed via**: `pneuma-deployments/platform/overlays/<env>/pneuma-terraformer/`
 

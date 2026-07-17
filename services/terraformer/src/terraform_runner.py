@@ -74,6 +74,21 @@ class PlatformSecretsInputs:
 
 
 @dataclass(frozen=True)
+class PlatformBusTopologyInputs:
+    """Inputs to the platform-bus-topology reconcile harness.
+
+    Single env-scoped workspace per cluster — no per-tenant axis, mirrors
+    PlatformSecretsInputs above. Workspace key: `platform/bus-topology/<env>.tfstate`
+    (see pneuma-deployments' modules/platform-bus-topology/README.md
+    "State-key convention" — deliberately disjoint from both
+    `platform-secrets/<env>.tfstate` and every per-tenant
+    `tenants/<tenant_id>.tfstate` key).
+    """
+
+    env: str  # dev | tst | prod
+
+
+@dataclass(frozen=True)
 class TerraformResult:
     exit_code: int
     stdout: str
@@ -589,6 +604,143 @@ class TerraformRunner:
             workdir = await self._ensure_platform_workspace(env)
             await self._init_platform(workdir, env)
             await self._platform_tfvars_file(workdir, inputs)
+            try:
+                result = await self._spawn(
+                    workdir,
+                    ["apply", "-auto-approve", "-no-color"],
+                    timeout=self._settings.apply_timeout_seconds,
+                )
+                if result.exit_code != 0:
+                    raise TerraformError("apply", result)
+                outputs = await self._output_json(workdir)
+                return TerraformResult(
+                    exit_code=result.exit_code,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    outputs=outputs,
+                )
+            finally:
+                self._wipe_tfvars(workdir)
+
+
+    # --- Platform-bus-topology reconcile (provisioning.apply_platform_bus_topology) ---
+    def _platform_bus_topology_workdir(self, env: str) -> Path:
+        """Single env-scoped workspace per cluster — distinct from both
+        the per-tenant workspaces AND the platform-secrets workspace.
+        Held under workdir_root/_platform_bus_topology/<env> so the same
+        path-traversal defence kicks in if a malformed env value reaches
+        this method (mirrors _platform_secrets_workdir)."""
+        if env not in ("dev", "tst", "prod"):
+            raise ValueError(f"invalid env {env!r}")
+        root = self._settings.terraform_workdir_root.resolve()
+        candidate = (root / "_platform_bus_topology" / env).resolve()
+        if not str(candidate).startswith(str(root) + "/"):
+            raise ValueError(f"platform-bus-topology env {env!r} escapes workdir root")
+        return candidate
+
+    def _platform_bus_topology_source(self) -> Path:
+        return self._settings.terraform_standalone_root / "platform-bus-topology-apply"
+
+    def _platform_bus_topology_backend_config(self, env: str) -> dict[str, str]:
+        # Same flat-primitives-only key set as _backend_config() /
+        # _platform_secrets_backend_config() above — every workspace on
+        # this runner shares the identical, TF-1.9-verified S3
+        # backend-config shape (see _backend_config's comment for why
+        # nested `endpoints` cannot be a CLI -backend-config argument).
+        # Key is `platform/bus-topology/<env>.tfstate` — deliberately
+        # disjoint from `platform-secrets/<env>.tfstate` and every
+        # per-tenant `tenants/<tenant_id>.tfstate` key. See
+        # pneuma-deployments' modules/platform-bus-topology/README.md
+        # "State-key convention" — this is the canonical key that doc
+        # names for the future backend-config wiring; this is that PR.
+        s = self._settings
+        return {
+            "bucket": s.tf_state_backend_bucket,
+            "key": f"platform/bus-topology/{env}.tfstate",
+            "region": s.tf_state_backend_region,
+            "use_path_style": "true",
+            "skip_credentials_validation": "true",
+            "skip_region_validation": "true",
+            "skip_metadata_api_check": "true",
+            "skip_requesting_account_id": "true",
+        }
+
+    def _platform_bus_topology_tfvars(
+        self, inputs: "PlatformBusTopologyInputs"
+    ) -> dict[str, str]:
+        # The standalone harness's only required root variable is `env`;
+        # `platform_vhost` defaults to null (computes /pneuma-<env>) and
+        # is intentionally not overridden here — no caller-supplied
+        # vhost override surface.
+        return {"env": inputs.env}
+
+    async def _ensure_platform_bus_topology_workspace(self, env: str) -> Path:
+        workdir = self._platform_bus_topology_workdir(env)
+        workdir.mkdir(parents=True, exist_ok=True)
+        source = self._platform_bus_topology_source()
+        if not source.exists():
+            raise TerraformError(
+                "init",
+                TerraformResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"platform-bus-topology harness not found at {source}",
+                    outputs={},
+                ),
+            )
+        for f in source.iterdir():
+            if f.is_file():
+                shutil.copy2(f, workdir / f.name)
+        return workdir
+
+    async def _init_platform_bus_topology(self, workdir: Path, env: str) -> None:
+        backend_args: list[str] = []
+        for k, v in self._platform_bus_topology_backend_config(env).items():
+            backend_args.extend(["-backend-config", f"{k}={v}"])
+        result = await self._spawn(
+            workdir,
+            ["init", "-input=false", "-no-color", *backend_args],
+            timeout=self._settings.apply_timeout_seconds,
+        )
+        if result.exit_code != 0:
+            raise TerraformError("init", result)
+
+    async def _platform_bus_topology_tfvars_file(
+        self, workdir: Path, inputs: "PlatformBusTopologyInputs"
+    ) -> Path:
+        path = workdir / "terraform.tfvars.json"
+        path.write_text(json.dumps(self._platform_bus_topology_tfvars(inputs)))
+        return path
+
+    async def reconcile_platform_bus_topology(
+        self, inputs: "PlatformBusTopologyInputs"
+    ) -> TerraformResult:
+        """Dispatch target for `provisioning.apply_platform_bus_topology`.
+
+        Runs the standalone harness at
+        `infrastructure/terraform/standalone/platform-bus-topology-apply`
+        against the env-scoped workspace. The harness reconciles the
+        shared pooled `/pneuma-<env>` RabbitMQ vhost topology (exchanges,
+        queues, bindings, per-service ACLs) from the vendored bus-topology
+        SSOT (`modules/platform-bus-topology/_generated/bus_topology.auto.tfvars.json`,
+        read by the harness itself via `jsondecode(file(...))` — never
+        passed as a runner var-file). Idempotent.
+
+        BUILD-ONLY / inert today (see pneuma-deployments'
+        modules/platform-bus-topology/README.md "BUILD-ONLY — not yet
+        live"): a real `terraform apply` against a live environment is
+        gated on a separate, later, Dean-approved `terraform import` +
+        Helm-range-removal step (plan §P5.3). This method — and the gRPC
+        handler that calls it — exist so that later activation is a
+        cycle-status flip (`core:platform_apply_bus_topology`
+        `draft` → `active`, plan §P7.3), not a code change. Nothing
+        dispatches this method today.
+        """
+        env = inputs.env
+        async with self._lock_for(f"_platform_bus_topology_{env}"):
+            workdir = await self._ensure_platform_bus_topology_workspace(env)
+            await self._init_platform_bus_topology(workdir, env)
+            await self._platform_bus_topology_tfvars_file(workdir, inputs)
             try:
                 result = await self._spawn(
                     workdir,

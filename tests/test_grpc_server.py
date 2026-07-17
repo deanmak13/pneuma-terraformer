@@ -28,12 +28,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import grpc
 import pytest
+from pneuma_proto.provisioning.platform.v1 import (
+    platform_provisioning_api_pb2,
+    platform_provisioning_api_pb2_grpc,
+)
 from pneuma_proto.provisioning.provisioning.v1 import (
     provisioning_api_pb2,
     provisioning_api_pb2_grpc,
 )
 
-from services.terraformer.src.grpc_server import ProvisioningService, start_grpc_server
+from services.terraformer.src.grpc_server import (
+    PlatformProvisioningService,
+    ProvisioningService,
+    start_grpc_server,
+)
 from services.terraformer.src.settings import Settings, get_settings
 from services.terraformer.src.terraform_runner import TerraformError, TerraformResult
 
@@ -61,6 +69,8 @@ def _fake_runner() -> MagicMock:
         reconcile=AsyncMock(),
         destroy=AsyncMock(),
         state=AsyncMock(),
+        reconcile_platform_secrets=AsyncMock(),
+        reconcile_platform_bus_topology=AsyncMock(),
     )
 
 
@@ -472,6 +482,155 @@ async def test_get_tenant_state_rejects_path_traversal_tenant_id() -> None:
 
 
 # ---------------------------------------------------------------------------
+# PlatformProvisioningService.ApplyPlatformBusTopology (P5.2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_bus_topology_returns_resources_duration_and_summary() -> None:
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_bus_topology.return_value = TerraformResult(
+        exit_code=0,
+        stdout="...\nApply complete! Resources: 12 added, 0 changed, 0 destroyed.\n",
+        stderr="",
+        outputs={
+            "vhost": "/pneuma-tst",
+            "exchanges": {"pneuma.events": "pneuma.events"},
+        },
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformBusTopologyRequest(
+        env="tst", correlation_id="corr-001",
+    )
+    context = _fake_context()
+
+    response = await servicer.ApplyPlatformBusTopology(request, context)
+
+    runner.reconcile_platform_bus_topology.assert_awaited_once()
+    inputs = runner.reconcile_platform_bus_topology.await_args.args[0]
+    assert inputs.env == "tst"
+
+    assert response.resources["vhost"] == "/pneuma-tst"
+    assert "exchanges" in response.resources
+    assert response.exit_code == 0
+    assert "Apply complete" in response.runner_summary
+    assert response.duration_ms >= 0
+    context.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_bus_topology_forwards_env_from_request() -> None:
+    """The env field on the request must drive PlatformBusTopologyInputs —
+    proves the servicer doesn't hardcode a single env (design-for-N: dev
+    / tst / prod all flow through identically)."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_bus_topology.return_value = TerraformResult(
+        exit_code=0, stdout="", stderr="", outputs={},
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformBusTopologyRequest(env="prod")
+    context = _fake_context()
+
+    await servicer.ApplyPlatformBusTopology(request, context)
+
+    inputs = runner.reconcile_platform_bus_topology.await_args.args[0]
+    assert inputs.env == "prod"
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_bus_topology_error_scrubs_secret_and_maps_to_internal() -> None:
+    """SECURITY: mirrors test_reconcile_error_scrubs_secret_from_abort_message
+    for the platform-tier RPC — a TerraformError whose stderr embeds a live
+    credential value must NOT leak that value into the gRPC abort()
+    message."""
+    settings = get_settings()
+    secret = settings.rabbitmq_admin_password
+    runner = _fake_runner()
+    runner.reconcile_platform_bus_topology.side_effect = TerraformError(
+        "apply",
+        TerraformResult(
+            exit_code=1, stdout="", stderr=f"oops {secret} rejected", outputs={},
+        ),
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformBusTopologyRequest(env="tst")
+    context = _fake_context()
+
+    with pytest.raises(_Abort):
+        await servicer.ApplyPlatformBusTopology(request, context)
+
+    context.abort.assert_awaited_once()
+    code, message = context.abort.await_args.args
+    assert code == grpc.StatusCode.INTERNAL
+    assert secret not in message
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_bus_topology_timeout_maps_to_deadline_exceeded() -> None:
+    """Mirrors test_reconcile_timeout_maps_to_deadline_exceeded — exit_code
+    124 is the runner's own timeout sentinel."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_bus_topology.side_effect = TerraformError(
+        "apply",
+        TerraformResult(exit_code=124, stdout="", stderr="timed out", outputs={}),
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformBusTopologyRequest(env="tst")
+    context = _fake_context()
+
+    with pytest.raises(_Abort):
+        await servicer.ApplyPlatformBusTopology(request, context)
+
+    code, _message = context.abort.await_args.args
+    assert code == grpc.StatusCode.DEADLINE_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_bus_topology_invalid_env_maps_to_invalid_argument() -> None:
+    """The runner's _platform_bus_topology_workdir raises ValueError for
+    an env outside {dev, tst, prod} — the servicer must map that to
+    INVALID_ARGUMENT like every other ValueError path in this file."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_bus_topology.side_effect = ValueError(
+        "invalid env 'staging'"
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformBusTopologyRequest(env="staging")
+    context = _fake_context()
+
+    with pytest.raises(_Abort):
+        await servicer.ApplyPlatformBusTopology(request, context)
+
+    code, message = context.abort.await_args.args
+    assert code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "staging" in message
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_secrets_is_unimplemented_via_inherited_base() -> None:
+    """ApplyPlatformSecrets is deliberately NOT implemented by this PR
+    (see PlatformProvisioningService's docstring) — the inherited
+    generated-base default must answer UNIMPLEMENTED rather than the
+    servicer crashing with AttributeError. This is the regression guard
+    for that forced inheritance choice."""
+    settings = get_settings()
+    runner = _fake_runner()
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(env="tst")
+    context = MagicMock(name="ServicerContext")
+
+    with pytest.raises(NotImplementedError):
+        await servicer.ApplyPlatformSecrets(request, context)
+
+    context.set_code.assert_called_once_with(grpc.StatusCode.UNIMPLEMENTED)
+    runner.reconcile_platform_secrets.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Live-server smoke
 # ---------------------------------------------------------------------------
 
@@ -497,5 +656,37 @@ async def test_live_server_serves_get_tenant_state_over_a_real_channel() -> None
             )
         assert dict(response.resources) == {}
         runner.state.assert_awaited_once_with("t-live-001")
+    finally:
+        await server.stop(None)
+
+
+@pytest.mark.asyncio
+async def test_live_server_serves_apply_platform_bus_topology_over_a_real_channel() -> None:
+    """Boot a real `grpc.aio.Server` and round-trip one
+    `ApplyPlatformBusTopology` call through the generated
+    `PlatformProvisioningServiceStub` — proves
+    `add_PlatformProvisioningServiceServicer_to_server` is actually wired
+    into `start_grpc_server` (this is the regression guard for a future
+    edit that adds a new RPC to the servicer but forgets to register the
+    service on the server)."""
+    runner = _fake_runner()
+    runner.reconcile_platform_bus_topology.return_value = TerraformResult(
+        exit_code=0,
+        stdout="Apply complete! Resources: 1 added.",
+        stderr="",
+        outputs={"vhost": "/pneuma-tst"},
+    )
+
+    port = _free_port()
+    settings = Settings(grpc_port=port)
+    server = await start_grpc_server(settings, runner=runner)
+    try:
+        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+            stub = platform_provisioning_api_pb2_grpc.PlatformProvisioningServiceStub(channel)
+            response = await stub.ApplyPlatformBusTopology(
+                platform_provisioning_api_pb2.ApplyPlatformBusTopologyRequest(env="tst")
+            )
+        assert response.resources["vhost"] == "/pneuma-tst"
+        runner.reconcile_platform_bus_topology.assert_awaited_once()
     finally:
         await server.stop(None)

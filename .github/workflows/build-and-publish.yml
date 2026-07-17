@@ -29,7 +29,13 @@ env:
   # rebuild against a different ref, use workflow_dispatch(deployments_ref)
   # instead of editing this default. Verified locally 2026-07-11 against
   # modules/tenant + standalone/platform-secrets-apply (P3 build proof).
-  DEPLOYMENTS_REF: 02bb78400970f22f42bc72202bb6a04657c8a50c
+  # Bumped 2026-07-17 (P5.2) to pneuma-deployments#1283's merge commit —
+  # the ref that first adds modules/platform-bus-topology/ +
+  # standalone/platform-bus-topology-apply/, which this PR's
+  # TerraformRunner.reconcile_platform_bus_topology now reads from
+  # settings.terraform_standalone_root at runtime. Without this bump the
+  # baked image would lack that directory entirely.
+  DEPLOYMENTS_REF: d34df5c16018bfba24bd97a16609c571873eae5d
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
