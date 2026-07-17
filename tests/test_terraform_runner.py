@@ -13,6 +13,7 @@ import pytest
 from services.terraformer.src import terraform_runner as runner_mod
 from services.terraformer.src.settings import Settings, get_settings
 from services.terraformer.src.terraform_runner import (
+    PlatformBusTopologyInputs,
     PlatformSecretsInputs,
     TenantInputs,
     TerraformError,
@@ -837,3 +838,311 @@ async def test_destroy_uses_explicit_timeout_over_settings_default() -> None:
         await runner.destroy(_stub_inputs(), timeout=17)
 
     assert 17 in captured_timeouts
+
+
+# ---------------------------------------------------------------------------
+# P5.2 — platform-bus-topology reconcile (provisioning.apply_platform_bus_topology)
+# ---------------------------------------------------------------------------
+
+
+def _seed_bus_topology_standalone(standalone_root: Path) -> None:
+    src = standalone_root / "platform-bus-topology-apply"
+    src.mkdir(parents=True)
+    (src / "main.tf").write_text('terraform {\n  required_version = ">= 1.6"\n}\n')
+
+
+def test_platform_bus_topology_backend_config_matches_state_key_convention() -> None:
+    """Key must be exactly `platform/bus-topology/<env>.tfstate` — the
+    convention documented in pneuma-deployments'
+    modules/platform-bus-topology/README.md 'State-key convention'.
+    Same flat-primitives-only shape as every other backend-config dict on
+    this runner (no secrets, no nested `endpoints`)."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    cfg = runner._platform_bus_topology_backend_config("tst")
+    assert cfg["key"] == "platform/bus-topology/tst.tfstate"
+    assert cfg["bucket"] == settings.tf_state_backend_bucket
+    assert cfg["use_path_style"] == "true"
+    assert cfg["skip_requesting_account_id"] == "true"
+    assert "endpoints" not in cfg
+    assert "endpoint" not in cfg
+    assert "access_key" not in cfg
+    assert "secret_key" not in cfg
+    assert "force_path_style" not in cfg
+
+
+def test_platform_bus_topology_state_key_disjoint_from_tenant_and_platform_secrets_keys() -> None:
+    """Explicit collision guard: the platform-bus-topology state key must
+    NEVER match a per-tenant `tenants/<tenant_id>.tfstate` key or the
+    platform-secrets `platform-secrets/<env>.tfstate` key — for every env
+    AND even for adversarial tenant_ids that echo the bus-topology
+    naming (e.g. a tenant literally called 'bus-topology' or
+    'platform-bus-topology' must still land under `tenants/`, never
+    `platform/`)."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    for env in ("dev", "tst", "prod"):
+        bus_topology_key = runner._platform_bus_topology_backend_config(env)["key"]
+        platform_secrets_key = runner._platform_secrets_backend_config(env)["key"]
+
+        assert bus_topology_key == f"platform/bus-topology/{env}.tfstate"
+        assert bus_topology_key != platform_secrets_key
+        assert not bus_topology_key.startswith("tenants/")
+        assert not platform_secrets_key.startswith("platform/bus-topology/")
+
+    adversarial_tenant_ids = ("bus-topology", "platform-bus-topology", "platform-secrets", "prod")
+    for tenant_id in adversarial_tenant_ids:
+        tenant_key = runner._backend_config(tenant_id)["key"]
+        assert tenant_key.startswith("tenants/")
+        assert tenant_key != "platform/bus-topology/tst.tfstate"
+        assert tenant_key not in {
+            runner._platform_bus_topology_backend_config(e)["key"] for e in ("dev", "tst", "prod")
+        }
+
+
+def test_platform_bus_topology_tfvars_only_carries_env() -> None:
+    """The standalone harness's only required root variable is `env` —
+    `platform_vhost` defaults to null and must NOT be set here (no
+    caller-supplied vhost-override surface)."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    vars_ = runner._platform_bus_topology_tfvars(PlatformBusTopologyInputs(env="tst"))
+    assert vars_ == {"env": "tst"}
+
+
+def test_platform_bus_topology_workdir_rejects_invalid_env() -> None:
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    with pytest.raises(ValueError, match="invalid env"):
+        runner._platform_bus_topology_workdir("staging")
+
+
+def test_platform_bus_topology_workdir_isolated_from_platform_secrets_workdir() -> None:
+    """The two platform-tier workspaces must resolve to different
+    filesystem paths even for the same env — a shared directory would
+    let a stale tfvars/backend file from one reconcile bleed into the
+    other's `terraform init`."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    bus_topology_dir = runner._platform_bus_topology_workdir("tst")
+    platform_secrets_dir = runner._platform_secrets_workdir("tst")
+    assert bus_topology_dir != platform_secrets_dir
+    assert str(bus_topology_dir).startswith(str(settings.terraform_workdir_root.resolve()))
+
+
+@pytest.mark.asyncio
+async def test_ensure_platform_bus_topology_workspace_copies_source_files(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_bus_topology_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    workdir = await runner._ensure_platform_bus_topology_workspace("tst")
+    assert (workdir / "main.tf").exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_platform_bus_topology_workspace_missing_source_raises() -> None:
+    """Mirrors _ensure_platform_workspace's missing-harness guard — a
+    baked-image regression (harness dir absent) must surface as a
+    TerraformError, not a raw FileNotFoundError from shutil/iterdir."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    with pytest.raises(TerraformError) as exc_info:
+        await runner._ensure_platform_bus_topology_workspace("tst")
+    assert exc_info.value.command == "init"
+    assert "platform-bus-topology-apply" in exc_info.value.result.stderr
+
+
+@pytest.mark.asyncio
+async def test_reconcile_platform_bus_topology_happy_path(tmp_path: Path) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_bus_topology_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    fake_init = TerraformResult(exit_code=0, stdout="initialized", stderr="", outputs={})
+    fake_apply = TerraformResult(
+        exit_code=0,
+        stdout="Apply complete! Resources: 12 added, 0 changed, 0 destroyed.",
+        stderr="",
+        outputs={},
+    )
+    fake_output = TerraformResult(
+        exit_code=0,
+        stdout=json.dumps({"vhost": {"value": "/pneuma-tst"}}),
+        stderr="",
+        outputs={},
+    )
+    spawn_results = iter([fake_init, fake_apply, fake_output])
+
+    async def _fake_spawn(workdir, args, timeout):  # noqa: ARG001
+        return next(spawn_results)
+
+    with patch.object(runner, "_spawn", AsyncMock(side_effect=_fake_spawn)):
+        result = await runner.reconcile_platform_bus_topology(
+            PlatformBusTopologyInputs(env="tst")
+        )
+
+    assert result.exit_code == 0
+    assert result.outputs["vhost"] == "/pneuma-tst"
+    assert "Apply complete" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_reconcile_platform_bus_topology_propagates_apply_failure(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_bus_topology_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    fake_init = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+    fake_apply = TerraformResult(
+        exit_code=1, stdout="", stderr="Error: vhost already managed by Helm", outputs={},
+    )
+    spawn_results = iter([fake_init, fake_apply])
+
+    async def _fake_spawn(workdir, args, timeout):  # noqa: ARG001
+        return next(spawn_results)
+
+    with patch.object(runner, "_spawn", AsyncMock(side_effect=_fake_spawn)):
+        with pytest.raises(TerraformError) as exc_info:
+            await runner.reconcile_platform_bus_topology(
+                PlatformBusTopologyInputs(env="tst")
+            )
+
+    assert exc_info.value.command == "apply"
+    assert "already managed by Helm" in exc_info.value.result.stderr
+
+
+@pytest.mark.asyncio
+async def test_reconcile_platform_bus_topology_wipes_terraform_tfvars_json(
+    tmp_path: Path,
+) -> None:
+    """Mirrors test_reconcile_platform_secrets_wipes_terraform_tfvars_json
+    — the tfvars file (carrying no secrets here, but the same wipe
+    discipline applies uniformly across every reconcile path) must not
+    persist on disk after a run."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_bus_topology_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+    ok = TerraformResult(exit_code=0, stdout="ok", stderr="", outputs={})
+
+    with patch.object(runner, "_spawn", AsyncMock(return_value=ok)):
+        with patch.object(runner, "_output_json", AsyncMock(return_value={})):
+            await runner.reconcile_platform_bus_topology(PlatformBusTopologyInputs(env="tst"))
+
+    tfvars = settings.terraform_workdir_root / "_platform_bus_topology" / "tst" / "terraform.tfvars.json"
+    assert not tfvars.exists(), "terraform.tfvars.json must be wiped after platform-bus-topology reconcile"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_platform_bus_topology_wipes_tfvars_on_apply_failure(
+    tmp_path: Path,
+) -> None:
+    """Even when apply fails the tfvars file is still wiped — mirrors
+    test_reconcile_wipes_tfvars_on_apply_failure for the tenant path."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_bus_topology_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    init_ok = TerraformResult(exit_code=0, stdout="init-ok", stderr="", outputs={})
+    apply_fail = TerraformResult(exit_code=1, stdout="", stderr="apply boom", outputs={})
+    spawn_results = [init_ok, apply_fail]
+
+    async def _fake_spawn(*args, **kwargs):
+        return spawn_results.pop(0)
+
+    with patch.object(runner, "_spawn", side_effect=_fake_spawn):
+        with pytest.raises(TerraformError):
+            await runner.reconcile_platform_bus_topology(PlatformBusTopologyInputs(env="tst"))
+
+    tfvars = settings.terraform_workdir_root / "_platform_bus_topology" / "tst" / "terraform.tfvars.json"
+    assert not tfvars.exists(), "tfvars must be wiped even on apply failure"
+
+
+@pytest.mark.asyncio
+async def test_init_platform_bus_topology_raises_terraform_error_on_nonzero(
+    tmp_path: Path,
+) -> None:
+    """Mirrors test_init_raises_terraform_error_on_nonzero for the
+    bus-topology init path — keeps reconcile_platform_bus_topology on the
+    failure path when the backend-config init itself fails (e.g. a state
+    bucket permission issue), distinct from an apply failure."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    bad = TerraformResult(exit_code=1, stdout="", stderr="backend init boom", outputs={})
+    with patch.object(runner, "_spawn", AsyncMock(return_value=bad)):
+        with pytest.raises(TerraformError) as exc_info:
+            await runner._init_platform_bus_topology(workdir, "tst")
+    assert exc_info.value.command == "init"
+    assert exc_info.value.result.exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_init_platform_bus_topology_argv_carries_no_secret_values(
+    tmp_path: Path,
+) -> None:
+    """Recurrence guard mirroring test_init_argv_carries_no_secret_values
+    — the bus-topology backend config carries no secrets by construction
+    (same flat-primitives dict shape), but this locks the invariant at
+    the _init call site too."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    captured_args: list[list[str]] = []
+    ok = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+
+    async def _fake_spawn(wd, args, timeout):  # noqa: ARG001
+        captured_args.append(args)
+        return ok
+
+    with patch.object(runner, "_spawn", AsyncMock(side_effect=_fake_spawn)):
+        await runner._init_platform_bus_topology(workdir, "tst")
+
+    assert len(captured_args) == 1
+    for arg in captured_args[0]:
+        assert settings.tf_state_backend_secret_key not in arg
+        assert settings.tf_state_backend_access_key not in arg

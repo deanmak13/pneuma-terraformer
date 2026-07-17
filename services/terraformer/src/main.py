@@ -33,9 +33,17 @@ def _configure_logging() -> None:
 
 
 async def _sync_capabilities(settings) -> None:
-    """Auto-register Terraformer's provisioning.* gRPC capabilities."""
+    """Auto-register Terraformer's provisioning.* gRPC capabilities —
+    both the tenant-tier `ProvisioningService` RPCs and the platform-tier
+    `PlatformProvisioningService` RPCs (`apply_platform_secrets`,
+    `apply_platform_bus_topology`). Per the capabilities-default-global
+    LAW, every proto RPC carrying `option (capability)` gets synced here
+    regardless of whether its gRPC handler is fully wired yet — see
+    grpc_server.py's `PlatformProvisioningService` docstring for
+    `ApplyPlatformSecrets`' current UNIMPLEMENTED status."""
     logger = logging.getLogger("terraformer.proto_sync")
     try:
+        from pneuma_proto.provisioning.platform.v1 import platform_provisioning_api_pb2
         from pneuma_proto.provisioning.provisioning.v1 import provisioning_api_pb2
 
         from services.terraformer.src.capability_sync import (
@@ -52,7 +60,10 @@ async def _sync_capabilities(settings) -> None:
         result = await sync_provisioning_capabilities(
             base_url=settings.supabase_url,
             service_key=settings.supabase_service_key.get_secret_value(),
-            file_descriptors=[provisioning_api_pb2.DESCRIPTOR],
+            file_descriptors=[
+                provisioning_api_pb2.DESCRIPTOR,
+                platform_provisioning_api_pb2.DESCRIPTOR,
+            ],
             grpc_target=settings.computed_grpc_target,
         )
         logger.info(

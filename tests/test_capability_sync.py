@@ -16,6 +16,7 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
+from pneuma_proto.provisioning.platform.v1 import platform_provisioning_api_pb2
 from pneuma_proto.provisioning.provisioning.v1 import provisioning_api_pb2
 
 from services.terraformer.src.capability_sync import (
@@ -31,6 +32,10 @@ _EXPECTED_NAMES = {
     "provisioning.apply_tenant_resources",
     "provisioning.destroy_tenant_resources",
     "provisioning.read_tenant_state",
+}
+_EXPECTED_PLATFORM_NAMES = {
+    "provisioning.apply_platform_secrets",
+    "provisioning.apply_platform_bus_topology",
 }
 
 
@@ -97,6 +102,60 @@ def test_capability_rows_authority_is_operator_only_for_every_row() -> None:
     authority=operator_only per the proto annotations."""
     for row in _rows():
         assert row["authority"] == "operator_only"
+
+
+# ---------------------------------------------------------------------------
+# _capability_rows — platform-tier descriptor (P5.2)
+# ---------------------------------------------------------------------------
+
+
+def _platform_rows() -> list[dict]:
+    return _capability_rows([platform_provisioning_api_pb2.DESCRIPTOR], _GRPC_TARGET)
+
+
+def test_platform_capability_rows_produces_exactly_the_two_platform_rpcs() -> None:
+    rows = _platform_rows()
+    assert len(rows) == 2
+    assert {row["name"] for row in rows} == _EXPECTED_PLATFORM_NAMES
+
+
+def test_platform_capability_rows_carry_grpc_internal_dispatch_shape() -> None:
+    rows = _platform_rows()
+    for row in rows:
+        assert row["connector_mode"] == "grpc_internal"
+        assert row["protocol"] == "grpc"
+        assert row["webhook_url"] == _GRPC_TARGET
+        assert row["capability_class"] == "platform_internal"
+        assert row["is_advertised"] is False
+        assert row["is_active"] is True
+
+
+def test_platform_capability_rows_effect_and_authority_match_proto_annotations() -> None:
+    """Per provisioning/platform/v1/platform_provisioning_api.proto: both
+    RPCs are perform_external_action / operator_only / data_class
+    operational (NOT secrets — invariant I2 would force is_active=false,
+    which would defeat proto-registering these at all; the payload never
+    carries secret VALUES, only path/resource identifiers)."""
+    by_name = {row["name"]: row for row in _platform_rows()}
+    for name in _EXPECTED_PLATFORM_NAMES:
+        assert by_name[name]["effect"] == "perform_external_action"
+        assert by_name[name]["authority"] == "operator_only"
+        assert by_name[name]["risk_category"] == "act"
+        assert by_name[name]["data_class"] == ["operational"]
+
+
+def test_platform_and_tenant_capability_rows_combine_without_name_collision() -> None:
+    """main.py's _sync_capabilities passes BOTH descriptors together —
+    the 3 tenant-tier + 2 platform-tier capability names must never
+    collide when synced in the same call."""
+    combined = _capability_rows(
+        [provisioning_api_pb2.DESCRIPTOR, platform_provisioning_api_pb2.DESCRIPTOR],
+        _GRPC_TARGET,
+    )
+    names = [row["name"] for row in combined]
+    assert len(names) == 5
+    assert len(names) == len(set(names))
+    assert set(names) == _EXPECTED_NAMES | _EXPECTED_PLATFORM_NAMES
 
 
 # ---------------------------------------------------------------------------

@@ -36,12 +36,18 @@ FROM hashicorp/terraform:1.9 AS tf
 
 # ---- Proto wheel ----
 # Pinned (not :latest) — see docs/plans/2026-07-11-terraformer-onboarding-
-# provisioning.md §2 "verify-before-pin" gate for why 0.44.0: it is the
-# lowest published tag confirmed (by pb2 introspection) to carry
-# RunTenantDestroyRequest.authorized_by/.reason/.timeout_seconds and
-# RunTenantReconcileRequest.timeout_seconds. pr-checks.yml guards against
-# this regressing back to :latest.
-FROM ghcr.io/deanmak13/pneuma-proto:0.44.0 AS proto
+# provisioning.md §2 "verify-before-pin" gate. Bumped 0.44.0 → 0.49.0
+# (P5.2): 0.49.0 is the tag that ships
+# `pneuma_proto.provisioning.platform.v1.platform_provisioning_api_pb2`
+# — the `PlatformProvisioningService` service carrying
+# `ApplyPlatformSecrets`/`ApplyPlatformBusTopology` — verified by pulling
+# the GHCR wheel-carrier image and introspecting the extracted wheel
+# directly (present at 0.49.0; absent below). Prior gate's fields
+# (RunTenantDestroyRequest.authorized_by/.reason/.timeout_seconds,
+# RunTenantReconcileRequest.timeout_seconds) remain present — no
+# regression. pr-checks.yml guards against this regressing back to
+# :latest.
+FROM ghcr.io/deanmak13/pneuma-proto:0.49.0 AS proto
 
 # ---- Terraform provider plugin mirror ----
 # Pre-fetches every provider the tenant module's versions.tf declares so
