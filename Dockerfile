@@ -65,6 +65,33 @@ RUN terraform providers mirror -platform=linux_amd64 /opt/tf-plugin-mirror
 # pneuma-proto wheel copied from the GHCR wheel image. Capability
 # registration is fail-closed at startup; a Terraformer without proto stubs
 # is not a dispatchable Terraformer.
+#
+# The proto wheel and the local package are installed in ONE pip
+# invocation, both targeting --prefix=/install. `pip install --prefix=X`
+# only installs a package into X if it isn't already satisfiable
+# elsewhere on sys.path — so installing them as two separate commands
+# (the first with no --prefix, landing in the builder stage's default
+# site-packages) let pip silently skip copying transitive dependencies
+# pulled in by the first install (e.g. the proto wheel's `pydantic` →
+# `typing_extensions`) into /install on the second command, since pip
+# considered them "already satisfied" globally. The runtime stage only
+# COPYs /install, so those skipped packages were never in the final
+# image — first surfaced as a `ModuleNotFoundError: No module named
+# 'typing_extensions'` crash-loop on first-ever boot (2026-07-17). A
+# single combined install resolves the full dependency graph together
+# and lands every transitive package in /install exactly once — the fix
+# is the build mechanism, not pinning the one package that happened to
+# go missing this time.
+#
+# --ignore-installed forces the FULL resolved graph into --prefix
+# regardless of what's already satisfiable on the ambient sys.path — the
+# combined install alone only closes the skip for packages absent from
+# the *pre-app* environment; `pip install --upgrade pip wheel build`
+# above still leaves pip/wheel/build (+ their deps: packaging,
+# pyproject_hooks, and possibly setuptools) on that ambient path before
+# the app graph resolves, so an app/proto dependency that happens to
+# overlap one of THOSE would hit the identical skip. --ignore-installed
+# closes the mechanism completely rather than narrowing the window.
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
@@ -73,8 +100,7 @@ RUN pip install --no-cache-dir --upgrade pip wheel build
 COPY pyproject.toml ./
 COPY services/ ./services/
 COPY --from=proto /wheels /tmp/proto-wheels
-RUN pip install --no-cache-dir /tmp/proto-wheels/pneuma_proto-*.whl
-RUN pip install --no-cache-dir --prefix=/install .
+RUN pip install --no-cache-dir --ignore-installed --prefix=/install /tmp/proto-wheels/pneuma_proto-*.whl .
 
 # ---- Runtime stage ----
 FROM python:3.12-slim
