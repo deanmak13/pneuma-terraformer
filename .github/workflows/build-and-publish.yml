@@ -7,13 +7,29 @@ on:
       - "services/**"
       - "pyproject.toml"
       - "Dockerfile"
+      - "tf/**"
       - ".github/workflows/build-and-publish.yml"
   workflow_dispatch:
+    inputs:
+      deployments_ref:
+        description: >-
+          pneuma-deployments git ref (sha/tag/branch) to bake the
+          Terraform modules from. Leave blank to use env.DEPLOYMENTS_REF
+          (the standing pin below).
+        required: false
+        type: string
 
 env:
   REGISTRY: ghcr.io
   OWNER: deanmak13
   IMAGE_NAME: pneuma-terraformer
+  # Standing pin for the pneuma-deployments ref baked into the image.
+  # Bump this when infrastructure/terraform/modules or
+  # infrastructure/terraform/standalone changes shape; for a one-off
+  # rebuild against a different ref, use workflow_dispatch(deployments_ref)
+  # instead of editing this default. Verified locally 2026-07-11 against
+  # modules/tenant + standalone/platform-secrets-apply (P3 build proof).
+  DEPLOYMENTS_REF: 02bb78400970f22f42bc72202bb6a04657c8a50c
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,6 +45,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve pneuma-deployments ref
+        id: deployments_ref
+        env:
+          # workflow_dispatch input — routed through env: (never inlined
+          # into the script body) so it can't be interpreted as shell.
+          INPUT_DEPLOYMENTS_REF: ${{ github.event.inputs.deployments_ref }}
+        run: |
+          ref="${INPUT_DEPLOYMENTS_REF}"
+          if [ -z "$ref" ]; then
+            ref="${DEPLOYMENTS_REF}"
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "Baking pneuma-deployments@${ref}"
+
+      # Bakes the tenant + platform-secrets Terraform modules into the
+      # image build context (Dockerfile COPYs from _deployments/). A
+      # read-only fine-grained PAT (DEPLOYMENTS_RO_TOKEN) is required
+      # because pneuma-deployments is a private repo the GITHUB_TOKEN of
+      # this repo cannot read. HUMAN GATE: DEPLOYMENTS_RO_TOKEN must be
+      # seeded as a repo secret before this workflow can run end to end.
+      - name: Checkout pneuma-deployments (pinned Terraform modules)
+        uses: actions/checkout@v4
+        with:
+          repository: deanmak13/pneuma-deployments
+          ref: ${{ steps.deployments_ref.outputs.ref }}
+          token: ${{ secrets.DEPLOYMENTS_RO_TOKEN }}
+          path: _deployments
+          sparse-checkout: |
+            infrastructure/terraform/modules
+            infrastructure/terraform/standalone
+          sparse-checkout-cone-mode: true
+
       - name: Compute tags
         id: tags
         env:
@@ -36,8 +84,11 @@ jobs:
         run: |
           image="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
           short="${GH_SHA:0:7}"
-          echo "tags=${image}:latest,${image}:sha-${short}" >> "$GITHUB_OUTPUT"
-          echo "Tags: ${image}:latest, ${image}:sha-${short}"
+          # No :latest tag — a floating tag on a baked-module image invites
+          # silent drift between "what's deployed" and "what module shape
+          # it was baked from". Every consumer pins sha-<short>.
+          echo "tags=${image}:sha-${short}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${image}:sha-${short}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -56,5 +107,7 @@ jobs:
           file: Dockerfile
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            DEPLOYMENTS_REF=${{ steps.deployments_ref.outputs.ref }}
           cache-from: type=gha,scope=terraformer
           cache-to: type=gha,scope=terraformer,mode=max

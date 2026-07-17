@@ -26,3 +26,8 @@ Thumbs.db
 *.tfstate.*
 .terraform/
 .terraform.lock.hcl
+
+# Build-context-only checkout of pneuma-deployments (Dockerfile bakes
+# infrastructure/terraform/{modules,standalone} from a pinned ref) —
+# never committed; see README.md "Local build".
+/_deployments/

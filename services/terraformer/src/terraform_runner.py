@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -39,6 +40,15 @@ from services.terraformer.src.settings import Settings, get_settings
 _LOG = logging.getLogger("terraformer.terraform")
 
 _TENANT_MODULE = "tenant"
+
+# Kubernetes ServiceAccount projection paths — module-level constants
+# (not Settings fields) so tests can monkeypatch them directly onto this
+# module without threading a new Settings field through every call site.
+# Both must exist for _provider_env() to populate KUBE_*: a pod running
+# without a mounted SA token has no business reconciling k8s-backed
+# tenant resources (ESO SecretStore bindings, RMQ Operator CRDs, ...).
+_KUBE_SA_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+_KUBE_SA_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 
 
 @dataclass(frozen=True)
@@ -139,18 +149,35 @@ class TerraformRunner:
         return self._settings.terraform_modules_root / _TENANT_MODULE
 
     def _backend_config(self, tenant_id: str) -> dict[str, str]:
+        # ONLY flat primitive (string/bool) attributes belong here —
+        # Terraform treats CLI `-backend-config k=v` VALUES as literal
+        # strings (cty.StringVal), never HCL, so an object-typed
+        # attribute like the S3 backend's nested `endpoints` CANNOT be
+        # set via CLI at all (hashicorp/terraform#34616, #36911): an
+        # inline `{s3="..."}` literal fails type conversion at init.
+        # The S3 endpoint therefore travels via AWS_ENDPOINT_URL_S3 on
+        # the subprocess env (see _spawn), which the AWS-SDK-v2-backed
+        # S3 backend (TF >= 1.6) reads as `endpoints.s3`. Credentials
+        # likewise stay env-only (AWS_ACCESS_KEY_ID /
+        # AWS_SECRET_ACCESS_KEY in _spawn) — never argv, where they'd
+        # be world-readable in /proc/<pid>/cmdline.
+        #
+        # Key semantics verified locally against hashicorp/terraform:1.9:
+        # the legacy `force_path_style` argument is deprecated in favour
+        # of `use_path_style`, and `skip_requesting_account_id=true` is
+        # required against a non-AWS S3-compatible endpoint (MinIO) —
+        # without it the backend's AWS account-ID lookup 403s and init
+        # fails outright even with skip_credentials_validation=true.
         s = self._settings
         return {
             "bucket": s.tf_state_backend_bucket,
             "key": f"tenants/{tenant_id}.tfstate",
             "region": s.tf_state_backend_region,
-            "endpoint": s.tf_state_backend_endpoint,
-            "access_key": s.tf_state_backend_access_key,
-            "secret_key": s.tf_state_backend_secret_key,
-            "force_path_style": "true",
+            "use_path_style": "true",
             "skip_credentials_validation": "true",
             "skip_region_validation": "true",
             "skip_metadata_api_check": "true",
+            "skip_requesting_account_id": "true",
         }
 
     def _tf_vars(self, inputs: TenantInputs) -> dict[str, str]:
@@ -209,13 +236,26 @@ class TerraformRunner:
             shlex.join([self._settings.terraform_binary, *safe_args]),
         )
 
-        import os
-
         env = os.environ.copy()
         env["TF_IN_AUTOMATION"] = "1"
         env["TF_INPUT"] = "0"
+        # Wires the baked filesystem provider mirror (Dockerfile `mirror`
+        # stage + tf/cli.tfrc) — terraform init never reaches the public
+        # registry.
+        env["TF_CLI_CONFIG_FILE"] = self._settings.tf_cli_config_file
         env["AWS_ACCESS_KEY_ID"] = self._settings.tf_state_backend_access_key
         env["AWS_SECRET_ACCESS_KEY"] = self._settings.tf_state_backend_secret_key
+        # The S3 backend's `endpoints.s3` attribute is object-typed and
+        # cannot be set via CLI -backend-config (values are literal
+        # strings, never HCL — hashicorp/terraform#34616, #36911). The
+        # AWS-SDK-v2-backed backend (TF >= 1.6) documents this env var as
+        # its equivalent source, so the MinIO endpoint travels env-only,
+        # exactly like the credentials above.
+        env["AWS_ENDPOINT_URL_S3"] = self._settings.tf_state_backend_endpoint
+        # Provider-plugin credentials (Postgres/RMQ/MinIO/Vault/Kubernetes)
+        # — env-only, never argv, so they never appear in a process
+        # listing or the redacted argv log line above.
+        env.update(self._provider_env())
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -257,6 +297,12 @@ class TerraformRunner:
                 shutil.copytree(item, target)
             else:
                 shutil.copy2(item, target)
+        # The tenant module ships with no backend block by design (reusable-
+        # module convention — see versions.tf's header comment in
+        # pneuma-deployments); the runner supplies the backend shape and
+        # binds it at init time via -backend-config. Without this stub,
+        # -backend-config args have no `backend "s3" {}` block to attach to.
+        (workdir / "backend.tf").write_text('terraform {\n  backend "s3" {}\n}\n')
         return workdir
 
     async def _init(self, workdir: Path, tenant_id: str) -> TerraformResult:
@@ -289,18 +335,77 @@ class TerraformRunner:
         return path
 
     def _wipe_tfvars(self, workdir: Path) -> None:
-        """Delete ``terraform.auto.tfvars.json`` between runs. The file
-        embeds every admin token in plaintext; leaving it on disk past
-        the apply means a future workspace read (or pod compromise)
-        exfiltrates the full credential set. Idempotent — silent if the
-        file is already gone."""
-        path = workdir / "terraform.auto.tfvars.json"
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            _LOG.warning("could not wipe tfvars file %s: %s", path, exc)
+        """Delete every credential-laden root-level tfvars file between
+        runs: the fixed ``terraform.tfvars.json`` (written by the
+        platform-secrets path) plus every root-level ``*.auto.tfvars.json``
+        (written by the tenant path — glob catches the primary
+        ``terraform.auto.tfvars.json`` and any future root-level
+        additions). These embed admin tokens in plaintext; leaving them on
+        disk past the apply means a future workspace read (or pod
+        compromise) exfiltrates the full credential set.
+
+        Non-recursive by design: ``_generated/*.auto.tfvars.json`` (the
+        module var-files written by an upstream generator — see
+        ``_module_var_files``) is declarative topology data, not
+        credentials, and must survive between runs so the next apply
+        still has it. Idempotent — silent if a file is already gone."""
+        paths = [workdir / "terraform.tfvars.json", *sorted(workdir.glob("*.auto.tfvars.json"))]
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                _LOG.warning("could not wipe tfvars file %s: %s", path, exc)
+
+    def _module_var_files(self, workdir: Path) -> list[str]:
+        """Flatten every ``_generated/*.auto.tfvars.json`` file (declarative
+        topology data written by an upstream generator — e.g. the RMQ bus
+        topology render step — never by this runner) into ``-var-file``
+        apply/destroy arguments. Empty list when the directory is absent,
+        which is the common case for tenants with no generated topology
+        overrides."""
+        generated = workdir / "_generated"
+        if not generated.exists():
+            return []
+        args: list[str] = []
+        for path in sorted(generated.glob("*.auto.tfvars.json")):
+            args.extend(["-var-file", f"_generated/{path.name}"])
+        return args
+
+    def _provider_env(self) -> dict[str, str]:
+        """Environment variables consumed directly by the terraform
+        provider plugins (postgresql/rabbitmq/minio/vault/kubernetes) so
+        their ``provider {}`` blocks in the tenant module can rely on each
+        plugin's own env-var convention instead of an explicit credential
+        attribute. Set on the subprocess environment only (see _spawn) —
+        never argv, never written to a var file — so they never appear in
+        a process listing or a log line.
+
+        The Kubernetes provider vars are populated only when this pod has
+        a projected ServiceAccount token (the standard in-cluster
+        signal) — a pod without one has no business reconciling
+        k8s-backed tenant resources, and probing KUBERNETES_SERVICE_HOST
+        unconditionally would silently point the provider at a stale/
+        wrong cluster in a local dev shell that happens to have that env
+        var set for an unrelated reason.
+        """
+        s = self._settings
+        env: dict[str, str] = {
+            "PGPASSWORD": s.postgres_superuser_password,
+            "RABBITMQ_PASSWORD": s.rabbitmq_admin_password,
+            "MINIO_USER": s.tf_state_backend_access_key,
+            "MINIO_PASSWORD": s.minio_admin_password,
+            "VAULT_TOKEN": s.openbao_admin_token,
+        }
+        if _KUBE_SA_TOKEN_PATH.exists() and _KUBE_SA_CA_CERT_PATH.exists():
+            host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
+            port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+            if host:
+                env["KUBE_HOST"] = f"https://{host}:{port}"
+            env["KUBE_TOKEN"] = _KUBE_SA_TOKEN_PATH.read_text().strip()
+            env["KUBE_CLUSTER_CA_CERT_DATA"] = _KUBE_SA_CA_CERT_PATH.read_text()
+        return env
 
     async def _output_json(self, workdir: Path) -> dict[str, Any]:
         result = await self._spawn(workdir, ["output", "-json"], timeout=30)
@@ -314,7 +419,8 @@ class TerraformRunner:
             return {}
         return {k: v.get("value") for k, v in raw.items()}
 
-    async def reconcile(self, inputs: TenantInputs) -> TerraformResult:
+    async def reconcile(self, inputs: TenantInputs, timeout: int | None = None) -> TerraformResult:
+        effective_timeout = timeout or self._settings.apply_timeout_seconds
         async with self._lock_for(inputs.tenant_id):
             workdir = await self._ensure_workspace(inputs.tenant_id)
             await self._init(workdir, inputs.tenant_id)
@@ -322,8 +428,8 @@ class TerraformRunner:
             try:
                 result = await self._spawn(
                     workdir,
-                    ["apply", "-auto-approve", "-no-color"],
-                    timeout=self._settings.apply_timeout_seconds,
+                    ["apply", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
+                    timeout=effective_timeout,
                 )
                 if result.exit_code != 0:
                     raise TerraformError("apply", result)
@@ -340,7 +446,8 @@ class TerraformRunner:
                 # between runs.
                 self._wipe_tfvars(workdir)
 
-    async def destroy(self, inputs: TenantInputs) -> TerraformResult:
+    async def destroy(self, inputs: TenantInputs, timeout: int | None = None) -> TerraformResult:
+        effective_timeout = timeout or self._settings.destroy_timeout_seconds
         async with self._lock_for(inputs.tenant_id):
             workdir = await self._ensure_workspace(inputs.tenant_id)
             await self._init(workdir, inputs.tenant_id)
@@ -348,8 +455,8 @@ class TerraformRunner:
             try:
                 result = await self._spawn(
                     workdir,
-                    ["destroy", "-auto-approve", "-no-color"],
-                    timeout=self._settings.destroy_timeout_seconds,
+                    ["destroy", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
+                    timeout=effective_timeout,
                 )
                 if result.exit_code != 0:
                     raise TerraformError("destroy", result)
@@ -403,18 +510,23 @@ class TerraformRunner:
         return self._settings.terraform_standalone_root / "platform-secrets-apply"
 
     def _platform_secrets_backend_config(self, env: str) -> dict[str, str]:
+        # Same flat-primitives-only key set as _backend_config() above —
+        # kept identical so the two workspaces (per-tenant,
+        # platform-secrets) never drift onto different-and-untested key
+        # shapes. Endpoint + credentials travel env-only via _spawn
+        # (AWS_ENDPOINT_URL_S3 / AWS_ACCESS_KEY_ID /
+        # AWS_SECRET_ACCESS_KEY) — see _backend_config's comment for why
+        # nested `endpoints` cannot be a CLI -backend-config argument.
         s = self._settings
         return {
             "bucket": s.tf_state_backend_bucket,
             "key": f"platform-secrets/{env}.tfstate",
             "region": s.tf_state_backend_region,
-            "endpoint": s.tf_state_backend_endpoint,
-            "access_key": s.tf_state_backend_access_key,
-            "secret_key": s.tf_state_backend_secret_key,
-            "force_path_style": "true",
+            "use_path_style": "true",
             "skip_credentials_validation": "true",
             "skip_region_validation": "true",
             "skip_metadata_api_check": "true",
+            "skip_requesting_account_id": "true",
         }
 
     def _platform_secrets_tfvars(self, inputs: "PlatformSecretsInputs") -> dict[str, str]:

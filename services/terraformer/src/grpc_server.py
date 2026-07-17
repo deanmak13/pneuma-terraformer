@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
 import grpc
 
+from services.terraformer.src.routes.provisioning import _TENANT_ID_PATTERN
 from services.terraformer.src.settings import Settings
 from services.terraformer.src.terraform_runner import (
     TenantInputs,
     TerraformError,
+    TerraformRunner,
     get_runner,
+    scrub_credentials,
 )
 
 _LOG = logging.getLogger("terraformer.grpc")
+
+_TENANT_ID_RE = re.compile(_TENANT_ID_PATTERN)
 
 
 def _string_map(values: dict[str, Any]) -> dict[str, str]:
@@ -49,12 +55,27 @@ async def _tenant_inputs(tenant_id: str, profile: str, workspace: str, settings:
     )
 
 
+def _terraform_error_code(exc: TerraformError) -> grpc.StatusCode:
+    # exit_code 124 is _spawn's own timeout sentinel (see terraform_runner.py
+    # _spawn's asyncio.TimeoutError branch) — map it to DEADLINE_EXCEEDED so
+    # callers can distinguish "ran out of time" from "terraform errored".
+    if exc.result.exit_code == 124:
+        return grpc.StatusCode.DEADLINE_EXCEEDED
+    return grpc.StatusCode.INTERNAL
+
+
 class ProvisioningService:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, runner: TerraformRunner | None = None):
         self._settings = settings
+        self._runner = runner or get_runner()
 
     async def RunTenantReconcile(self, request, context):
         pb2 = _pb2()
+        if not _TENANT_ID_RE.fullmatch(request.tenant_id):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"invalid tenant_id: {request.tenant_id!r}",
+            )
         started = time.monotonic()
         try:
             inputs = await _tenant_inputs(
@@ -63,19 +84,41 @@ class ProvisioningService:
                 request.workspace,
                 self._settings,
             )
-            result = await get_runner().reconcile(inputs)
+            result = await self._runner.reconcile(
+                inputs, timeout=request.timeout_seconds or None
+            )
             return pb2.RunTenantReconcileResponse(
                 resources=_string_map(result.outputs),
                 duration_ms=int((time.monotonic() - started) * 1000),
                 runner_summary=_summary(result.stdout),
                 exit_code=result.exit_code,
             )
-        except (TerraformError, ValueError) as exc:
-            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        except TerraformError as exc:
+            await context.abort(
+                _terraform_error_code(exc), scrub_credentials(str(exc), self._settings)
+            )
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
     async def RunTenantDestroy(self, request, context):
         pb2 = _pb2()
+        if not _TENANT_ID_RE.fullmatch(request.tenant_id):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"invalid tenant_id: {request.tenant_id!r}",
+            )
         started = time.monotonic()
+        # Audit line — RunTenantDestroy is irreversible and operator-gated
+        # upstream (offboarding confirmation flow); record who authorised it
+        # and why regardless of outcome. request.authorized_by/.reason are
+        # proto3 strings — "<unset>" makes a missing field visually distinct
+        # from an empty-but-provided one in the log.
+        _LOG.info(
+            "RunTenantDestroy audit: tenant_id=%s authorized_by=%s reason=%s",
+            request.tenant_id,
+            request.authorized_by or "<unset>",
+            request.reason or "<unset>",
+        )
         try:
             inputs = await _tenant_inputs(
                 request.tenant_id,
@@ -83,24 +126,43 @@ class ProvisioningService:
                 "",
                 self._settings,
             )
-            result = await get_runner().destroy(inputs)
+            result = await self._runner.destroy(
+                inputs, timeout=request.timeout_seconds or None
+            )
             return pb2.RunTenantDestroyResponse(
                 destroyed_resources=_string_map(result.outputs),
                 duration_ms=int((time.monotonic() - started) * 1000),
                 runner_summary=_summary(result.stdout),
                 exit_code=result.exit_code,
             )
-        except (TerraformError, ValueError) as exc:
-            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        except TerraformError as exc:
+            await context.abort(
+                _terraform_error_code(exc), scrub_credentials(str(exc), self._settings)
+            )
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
     async def GetTenantState(self, request, context):
         pb2 = _pb2()
+        if not _TENANT_ID_RE.fullmatch(request.tenant_id):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"invalid tenant_id: {request.tenant_id!r}",
+            )
         try:
-            state = await get_runner().state(request.tenant_id)
+            state = await self._runner.state(request.tenant_id)
             return pb2.GetTenantStateResponse(
                 resources=_string_map(state.get("outputs") or {}),
+                # Sanctioned document-zero: reading the true last-apply
+                # timestamp requires the .tfstate object's S3 metadata,
+                # which the raw-httpx capability_sync stopgap doesn't carry
+                # today. P4's typed-ORM refactor threads that through; until
+                # then this is honestly zero rather than a fabricated value.
                 last_applied_at=0,
-                state_path=f"tenants/{request.tenant_id}.tfstate",
+                state_path=(
+                    f"s3://{self._settings.tf_state_backend_bucket}"
+                    f"/tenants/{request.tenant_id}.tfstate"
+                ),
             )
         except ValueError as exc:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
@@ -119,12 +181,12 @@ def _pb2():
     return provisioning_api_pb2
 
 
-async def start_grpc_server(settings: Settings) -> grpc.aio.Server:
+async def start_grpc_server(settings: Settings, runner: TerraformRunner | None = None) -> grpc.aio.Server:
     from pneuma_proto.provisioning.provisioning.v1 import provisioning_api_pb2_grpc
 
     server = grpc.aio.server()
     provisioning_api_pb2_grpc.add_ProvisioningServiceServicer_to_server(
-        ProvisioningService(settings),
+        ProvisioningService(settings, runner=runner),
         server,
     )
     listen_addr = f"[::]:{settings.grpc_port}"

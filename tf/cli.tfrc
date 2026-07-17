@@ -1,0 +1,20 @@
+# Terraform CLI configuration — baked into the image at /app/tf/cli.tfrc
+# and wired via TF_CLI_CONFIG_FILE (see settings.tf_cli_config_file /
+# TerraformRunner._spawn()).
+#
+# Points every provider install at the filesystem mirror baked in the
+# `mirror` build stage (Dockerfile) instead of the public Terraform
+# registry — apply-time `terraform init` never needs network egress to
+# registry.terraform.io.
+#
+# Mirror coverage: the mirror is built from modules/tenant/versions.tf
+# (6 providers: postgresql/rabbitmq/minio/vault/kubernetes/random),
+# which is a superset of standalone/platform-secrets-apply's
+# requirements (hashicorp/vault only) — so no direct {} fallback block
+# is needed for either baked workspace.
+provider_installation {
+  filesystem_mirror {
+    path    = "/opt/tf-plugin-mirror"
+    include = ["*/*/*"]
+  }
+}

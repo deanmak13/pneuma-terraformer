@@ -10,26 +10,58 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Kept in lockstep with the Dockerfile's `proto` stage pin — see
+  # docs/plans/2026-07-11-terraformer-onboarding-provisioning.md §2
+  # "verify-before-pin" gate.
+  PROTO_IMAGE: ghcr.io/deanmak13/pneuma-proto:0.44.0
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Guard against an unpinned pneuma-proto base image
+        run: |
+          if grep -E 'pneuma-proto:latest' Dockerfile; then
+            echo "::error::Dockerfile pins ghcr.io/deanmak13/pneuma-proto:latest — pin an explicit version tag (see the verify-before-pin gate in docs/plans/2026-07-11-terraformer-onboarding-provisioning.md)." >&2
+            exit 1
+          fi
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # grpc_server.py + capability_sync.py import pneuma_proto
+      # unconditionally (no try/except fallback) — unlike
+      # services.common.*, which stays optional until pneuma-common
+      # ships (P4). The wheel is not on PyPI; extract it from the same
+      # pinned GHCR wheel-carrier image the Dockerfile's `proto` stage
+      # consumes.
+      - name: Fetch pinned pneuma-proto wheel
+        run: |
+          docker pull "${PROTO_IMAGE}"
+          cid=$(docker create --entrypoint /bin/sh "${PROTO_IMAGE}" -c true)
+          docker cp "${cid}:/wheels" ./proto-wheels
+          docker rm "${cid}" >/dev/null
+
       - name: Install package + dev deps
         run: |
           pip install --upgrade pip wheel
-          # services.common.* and pneuma_proto.* are optional runtime
-          # imports (try/except in services/terraformer/src/main.py); the
-          # service starts degraded if absent. Lint/test does not need them.
+          pip install --find-links ./proto-wheels pneuma_proto
           pip install -e ".[dev]"
 
       - name: ruff check
@@ -42,7 +74,7 @@ jobs:
         run: |
           pytest tests/ \
             -q --tb=short --maxfail=5 \
-            --cov=services/terraformer \
+            --cov=services \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml
 

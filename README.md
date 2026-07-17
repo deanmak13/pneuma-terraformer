@@ -5,53 +5,71 @@ Pneuma's Terraform runner service — declarative tenant-resource lifecycle.
 **Capability surface**: `provisioning.apply_tenant_resources` /
 `provisioning.destroy_tenant_resources` / `provisioning.read_tenant_state`.
 Dispatched by the `core:tenant_apply_resources` / `core:tenant_destroy_resources`
-cycles in `pneuma-engine`.
+cycles in `pneuma-engine` over gRPC.
 
 **Image**: `ghcr.io/deanmak13/pneuma-terraformer`
-**Port**: 8011 (gRPC + FastAPI)
+**Port**: 8011 (HTTP — health + the `apply_platform_secrets` route) /
+8012 (gRPC — the three provisioning.* RPCs)
 **Consumed by**: `pneuma-helm-charts/charts/pneuma-terraformer/`
 **Deployed via**: `pneuma-deployments/platform/overlays/<env>/pneuma-terraformer/`
 
 ---
 
-## Repo state (2026-05-31)
+## Repo state (2026-07-11)
 
-**Bootstrap commit only.** This repo was just created via the
-`pneuma-terraformer` relocation plan (`pneuma#301`) — Dean approved
-moving the service out of `pneuma-engine`'s `services/terraformer/`
-into its own top-level repo, mirroring the `pneuma-mem0` pattern.
+**Buildable — P3 shipped.** The image bakes a pinned `pneuma-deployments`
+Terraform module tree (`infrastructure/terraform/modules` +
+`infrastructure/terraform/standalone`, at the `DEPLOYMENTS_REF` build-arg
+/ `org.pneuma.deployments-ref` image label) plus a filesystem Terraform
+provider plugin mirror (`terraform providers mirror`, baked at
+`/opt/tf-plugin-mirror` and wired via `tf/cli.tfrc` +
+`TF_CLI_CONFIG_FILE`) — `terraform init` never reaches the public
+registry or a runtime mount/sidecar at apply time. State is
+S3-compatible (MinIO), reconfigured per-workspace via `-backend-config`
+using the verified TF 1.9 key set (`endpoints.s3` / `use_path_style` /
+`skip_requesting_account_id` — the legacy `endpoint` /
+`force_path_style` keys are deprecated as of the AWS-SDK-v2-backed S3
+backend). Provider credentials (Postgres / RabbitMQ / MinIO / Vault /
+Kubernetes) reach the `terraform` subprocess as environment variables
+only — never argv, never written to a var file — via
+`TerraformRunner._provider_env()`.
 
-The initial commit contains a **verbatim copy** of
-`pneuma-engine/services/terraformer/`. The `src/` Python still imports
-`services.common.db.client` and `services.common.proto_capability_sync`
-and the typed proto stubs from `pneuma_proto` — those are not yet
-satisfied by this repo's `pyproject.toml`.
+`pyproject.toml` still installs `pneuma-proto` from the pinned GHCR
+wheel-carrier image (see the Dockerfile's `proto` stage) rather than
+PyPI — the wheel is not published there. `services.common.db.client` /
+`services.common.proto_capability_sync` imports remain unsatisfied;
+`capability_sync.py` uses a typed-but-raw-`httpx` PostgREST client
+(`CapabilityRegistry`) as a stopgap, noted inline at every call site.
+**P4 owns replacing that stopgap with the published `pneuma-common`
+typed ORM** — see
+`pneuma/docs/plans/2026-07-11-terraformer-onboarding-provisioning.md`
+§4 P4. Do not hand-roll additional raw-httpx call sites here before
+that lands; extend `CapabilityRegistry` instead.
 
-### Outstanding work (follow-up session)
+### Local build
 
-1. **`pyproject.toml`** — pin `pneuma-proto` and add a dep on
-   `pneuma-common` (the shared library being extracted under
-   `Onboard-08 PR1`, task #183). Until that ships, vendor the
-   imported modules (`services.common.db.client`,
-   `services.common.proto_capability_sync`) inline as a stop-gap.
-2. **`.github/workflows/build-and-publish.yml`** — Docker image build
-   on `push` to `main`, tag `sha-<short>` + `:latest`, publish to
-   `ghcr.io/deanmak13/pneuma-terraformer`.
-3. **`.github/workflows/pr-checks.yml`** — `pytest tests/` + `ruff` +
-   `mypy` on every PR.
-4. **Dockerfile path rewrite** — current Dockerfile uses
-   `services/common/` / `services/terraformer/src/` paths that mirror
-   the engine repo layout. Either restructure the repo to mirror them
-   (keep `services/terraformer/`) or rewrite the COPY paths to
-   `pneuma_terraformer/`.
-5. **Engine PR** — `pneuma-engine` deletes
-   `services/terraformer/` + removes any `pyproject.toml` testpaths
-   entry referencing it.
-6. **Deployments PR** — `pneuma-deployments` bumps
-   `platform/overlays/<env>/pneuma-terraformer/values.yaml` image tag
-   to the first SHA the new CI publishes.
+The Dockerfile's build context needs a sparse `pneuma-deployments`
+checkout at `_deployments/` (gitignored — build-context-only, never
+committed):
 
-The plan: `pneuma/docs/plans/2026-05-30-pneuma-terraformer-relocation.md`.
+```sh
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/deanmak13/pneuma-deployments _deployments
+(cd _deployments && git sparse-checkout set \
+  infrastructure/terraform/modules infrastructure/terraform/standalone)
+DEPLOYMENTS_REF=$(git -C _deployments rev-parse HEAD)
+
+docker buildx build \
+  --build-arg DEPLOYMENTS_REF="$DEPLOYMENTS_REF" \
+  -t terraformer:local --load .
+```
+
+CI (`build-and-publish.yml`) performs the equivalent checkout via a
+second `actions/checkout` against a read-only PAT (`DEPLOYMENTS_RO_TOKEN`
+— human gate, see the plan) pinned to `env.DEPLOYMENTS_REF` (overridable
+per-run via `workflow_dispatch(deployments_ref)`).
+
+The plan: `pneuma/docs/plans/2026-07-11-terraformer-onboarding-provisioning.md`.
 
 ---
 
