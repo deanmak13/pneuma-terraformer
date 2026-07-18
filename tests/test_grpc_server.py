@@ -355,11 +355,15 @@ async def test_get_tenant_state_returns_state_path_and_resources() -> None:
 
 @pytest.mark.asyncio
 async def test_get_tenant_state_runner_value_error_maps_to_invalid_argument() -> None:
-    """`_TENANT_ID_RE.fullmatch` only catches a malformed tenant_id
-    SHAPE -- the runner's `.state()` call can still raise ValueError for
-    a well-shaped but otherwise invalid id (e.g. no matching tenant
-    workspace). Mirrors every other ValueError->INVALID_ARGUMENT path in
-    this file."""
+    """Defense-in-depth regression guard for GetTenantState's generic
+    `except ValueError` handler -- in production, `.state()` returns a
+    graceful `{"exists": False, ...}` sentinel rather than raising for a
+    nonexistent workspace, and `_workspace_dir()`'s own ValueError (path
+    traversal) is unreachable once `_TENANT_ID_RE.fullmatch` has already
+    passed upstream. This test proves the except-branch's wiring is
+    correct regardless, mirroring every other ValueError->INVALID_ARGUMENT
+    path in this file, in case a future runner change makes the branch
+    reachable in a way this test doesn't anticipate."""
     settings = get_settings()
     runner = _fake_runner()
     runner.state.side_effect = ValueError("no workspace for tenant t-005")
