@@ -351,7 +351,32 @@ async def test_get_tenant_state_returns_state_path_and_resources() -> None:
         f"s3://{settings.tf_state_backend_bucket}/tenants/t-004.tfstate"
     )
     assert response.last_applied_at == 0
-    context.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_tenant_state_runner_value_error_maps_to_invalid_argument() -> None:
+    """Defense-in-depth regression guard for GetTenantState's generic
+    `except ValueError` handler -- in production, `.state()` returns a
+    graceful `{"exists": False, ...}` sentinel rather than raising for a
+    nonexistent workspace, and `_workspace_dir()`'s own ValueError (path
+    traversal) is unreachable once `_TENANT_ID_RE.fullmatch` has already
+    passed upstream. This test proves the except-branch's wiring is
+    correct regardless, mirroring every other ValueError->INVALID_ARGUMENT
+    path in this file, in case a future runner change makes the branch
+    reachable in a way this test doesn't anticipate."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.state.side_effect = ValueError("no workspace for tenant t-005")
+    servicer = ProvisioningService(settings, runner=runner)
+    request = provisioning_api_pb2.GetTenantStateRequest(tenant_id="t-005")
+    context = _fake_context()
+
+    with pytest.raises(_Abort):
+        await servicer.GetTenantState(request, context)
+
+    code, message = context.abort.await_args.args
+    assert code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "t-005" in message
 
 
 # ---------------------------------------------------------------------------
@@ -611,23 +636,176 @@ async def test_apply_platform_bus_topology_invalid_env_maps_to_invalid_argument(
 
 
 @pytest.mark.asyncio
-async def test_apply_platform_secrets_is_unimplemented_via_inherited_base() -> None:
-    """ApplyPlatformSecrets is deliberately NOT implemented by this PR
-    (see PlatformProvisioningService's docstring) — the inherited
-    generated-base default must answer UNIMPLEMENTED rather than the
-    servicer crashing with AttributeError. This is the regression guard
-    for that forced inheritance choice."""
+async def test_apply_platform_secrets_returns_resources_duration_and_summary() -> None:
+    """`outputs` mirrors the REAL platform-secrets module's 4 named
+    Terraform outputs (pneuma-deployments infrastructure/terraform/
+    modules/platform-secrets/outputs.tf) -- reconciled_target_paths
+    (list), canonical_source_paths (list), entry_count (int),
+    fanout_summary (target_path -> list of secret KEY NAMES, never
+    values). A fake shaped like `{path: "3"}` (the proto's aspirational
+    doc-comment shape, not what terraform output -json actually emits)
+    would pass a test without exercising the handler's real mapping
+    logic — see the BLOCKER this replaces."""
     settings = get_settings()
     runner = _fake_runner()
+    runner.reconcile_platform_secrets.return_value = TerraformResult(
+        exit_code=0,
+        stdout="...\nApply complete! Resources: 8 added, 2 changed, 0 destroyed.\n",
+        stderr="",
+        outputs={
+            "reconciled_target_paths": [
+                "pneuma/platform/pneuma/tst/brain-api",
+                "pneuma/platform/pneuma/tst/tenant-api",
+            ],
+            "canonical_source_paths": ["pneuma/internal/tst/anthropic"],
+            "entry_count": 8,
+            "fanout_summary": {
+                "pneuma/platform/pneuma/tst/brain-api": ["ANTHROPIC_API_KEY"],
+                "pneuma/platform/pneuma/tst/tenant-api": [
+                    "STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET",
+                ],
+            },
+        },
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(
+        env="tst", correlation_id="corr-002",
+    )
+    context = _fake_context()
+
+    response = await servicer.ApplyPlatformSecrets(request, context)
+
+    runner.reconcile_platform_secrets.assert_awaited_once()
+    inputs = runner.reconcile_platform_secrets.await_args.args[0]
+    assert inputs.env == "tst"
+
+    # Path -> reference-entry COUNT (proto contract), derived from
+    # fanout_summary's per-path key-name lists -- not the raw
+    # output-block-name/repr()-string garbage the old handler produced.
+    assert response.resources["pneuma/platform/pneuma/tst/brain-api"] == "1"
+    assert response.resources["pneuma/platform/pneuma/tst/tenant-api"] == "2"
+    assert "reconciled_target_paths" not in response.resources
+    assert "entry_count" not in response.resources
+    assert response.exit_code == 0
+    assert "Apply complete" in response.runner_summary
+    assert response.duration_ms >= 0
+    context.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_secrets_missing_fanout_summary_returns_empty_resources() -> None:
+    """A malformed or missing `fanout_summary` output (e.g. a Terraform
+    module version drift, or a genuinely empty reconcile) must degrade
+    to an empty resources map, never raise -- resources is best-effort
+    audit metadata, not load-bearing for exit_code/duration_ms/
+    runner_summary, which the caller already relies on for success/
+    failure."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_secrets.return_value = TerraformResult(
+        exit_code=0, stdout="no changes", stderr="",
+        outputs={"entry_count": 0},
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(env="dev")
+    context = _fake_context()
+
+    response = await servicer.ApplyPlatformSecrets(request, context)
+
+    assert dict(response.resources) == {}
+    assert response.exit_code == 0
+    context.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_secrets_forwards_env_from_request() -> None:
+    """The env field on the request must drive PlatformSecretsInputs —
+    proves the servicer doesn't hardcode a single env (design-for-N: dev
+    / tst / prod all flow through identically)."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_secrets.return_value = TerraformResult(
+        exit_code=0, stdout="", stderr="", outputs={},
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(env="prod")
+    context = _fake_context()
+
+    await servicer.ApplyPlatformSecrets(request, context)
+
+    inputs = runner.reconcile_platform_secrets.await_args.args[0]
+    assert inputs.env == "prod"
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_secrets_error_scrubs_secret_and_maps_to_internal() -> None:
+    """SECURITY: a TerraformError whose stderr embeds a live credential
+    value must NOT leak that value into the gRPC abort() message — this
+    RPC's whole purpose is reconciling secret paths, so the scrub guard
+    matters even more here than on the sibling RPCs."""
+    settings = get_settings()
+    secret = settings.rabbitmq_admin_password
+    runner = _fake_runner()
+    runner.reconcile_platform_secrets.side_effect = TerraformError(
+        "apply",
+        TerraformResult(
+            exit_code=1, stdout="", stderr=f"oops {secret} rejected", outputs={},
+        ),
+    )
     servicer = PlatformProvisioningService(settings, runner=runner)
     request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(env="tst")
-    context = MagicMock(name="ServicerContext")
+    context = _fake_context()
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(_Abort):
         await servicer.ApplyPlatformSecrets(request, context)
 
-    context.set_code.assert_called_once_with(grpc.StatusCode.UNIMPLEMENTED)
-    runner.reconcile_platform_secrets.assert_not_called()
+    context.abort.assert_awaited_once()
+    code, message = context.abort.await_args.args
+    assert code == grpc.StatusCode.INTERNAL
+    assert secret not in message
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_secrets_timeout_maps_to_deadline_exceeded() -> None:
+    """Mirrors test_apply_platform_bus_topology_timeout_maps_to_deadline_exceeded
+    — exit_code 124 is the runner's own timeout sentinel."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_secrets.side_effect = TerraformError(
+        "apply",
+        TerraformResult(exit_code=124, stdout="", stderr="timed out", outputs={}),
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(env="tst")
+    context = _fake_context()
+
+    with pytest.raises(_Abort):
+        await servicer.ApplyPlatformSecrets(request, context)
+
+    code, _message = context.abort.await_args.args
+    assert code == grpc.StatusCode.DEADLINE_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_secrets_invalid_env_maps_to_invalid_argument() -> None:
+    """The runner's _platform_secrets_workdir path raises ValueError for
+    an env outside {dev, tst, prod} — the servicer must map that to
+    INVALID_ARGUMENT like every other ValueError path in this file."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_secrets.side_effect = ValueError(
+        "invalid env 'staging'"
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(env="staging")
+    context = _fake_context()
+
+    with pytest.raises(_Abort):
+        await servicer.ApplyPlatformSecrets(request, context)
+
+    code, message = context.abort.await_args.args
+    assert code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "staging" in message
 
 
 # ---------------------------------------------------------------------------

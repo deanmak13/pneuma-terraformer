@@ -14,6 +14,7 @@ from services.terraformer.src.routes.provisioning import _TENANT_ID_PATTERN
 from services.terraformer.src.settings import Settings
 from services.terraformer.src.terraform_runner import (
     PlatformBusTopologyInputs,
+    PlatformSecretsInputs,
     TenantInputs,
     TerraformError,
     TerraformRunner,
@@ -28,6 +29,32 @@ _TENANT_ID_RE = re.compile(_TENANT_ID_PATTERN)
 
 def _string_map(values: dict[str, Any]) -> dict[str, str]:
     return {str(k): "" if v is None else str(v) for k, v in values.items()}
+
+
+def _platform_secrets_resource_counts(outputs: dict[str, Any]) -> dict[str, str]:
+    """Map `TerraformRunner.reconcile_platform_secrets`'s raw `terraform
+    output -json` dict to `ApplyPlatformSecretsResponse.resources`'
+    documented shape: target OpenBao path -> reference-entry count.
+
+    The platform-secrets module (pneuma-deployments infrastructure/
+    terraform/modules/platform-secrets/outputs.tf) exposes 4 named
+    outputs — `reconciled_target_paths` (list), `canonical_source_paths`
+    (list), `entry_count` (a single cluster-wide int), and
+    `fanout_summary` (a map of target_path -> list of secret KEY NAMES,
+    never values). Passing the raw outputs dict through `_string_map`
+    would stringify Terraform's 4 OUTPUT-BLOCK NAMES as keys with
+    Python `repr()`-style list/dict dumps as values — not the
+    per-path count map the proto promises. `fanout_summary` is the one
+    output with the right per-path granularity; this derives the count
+    from the length of each path's key list.
+    """
+    fanout_summary = outputs.get("fanout_summary")
+    if not isinstance(fanout_summary, dict):
+        return {}
+    return {
+        str(path): str(len(keys)) if isinstance(keys, list) else "0"
+        for path, keys in fanout_summary.items()
+    }
 
 
 async def _tenant_inputs(tenant_id: str, profile: str, workspace: str, settings: Settings) -> TenantInputs:
@@ -191,24 +218,39 @@ class PlatformProvisioningService(platform_provisioning_api_pb2_grpc.PlatformPro
     (including the already-working tenant-tier RPCs) for a method this
     PR was never scoped to build.
 
-    ApplyPlatformBusTopology (P5.2, this PR) is the only RPC implemented
-    here. ApplyPlatformSecrets falls through to the inherited base
-    method, which correctly answers UNIMPLEMENTED — despite this task's
-    brief describing it as "an existing, working ApplyPlatformSecrets
-    gRPC handler to mirror," no such handler exists anywhere in this
-    repo's history (verified against `git log --all` + the plan doc,
-    docs/plans/2026-07-11-terraformer-onboarding-provisioning.md P4.4:
-    that item only proto-registered + capability-registered
-    `apply_platform_secrets`, and the fully-tested runner-level method
-    `TerraformRunner.reconcile_platform_secrets` has only ever been
-    dispatched over HTTP via POST /provisioning/reconcile-platform-secrets
-    — see routes/provisioning.py). Building ApplyPlatformSecrets' gRPC
-    handler is a separate, not-yet-scoped follow-up; UNIMPLEMENTED is the
-    honest answer until then, not a silent gap."""
+    ApplyPlatformBusTopology (P5.2) AND ApplyPlatformSecrets (P7.3
+    follow-up, unblocking core:platform_apply_secret_reconcile's
+    draft->active flip per docs/plans/2026-07-11-terraformer-onboarding-
+    provisioning.md human gate #6) are both implemented here — the fully
+    tested runner-level method `TerraformRunner.reconcile_platform_secrets`
+    already existed (previously dispatched only over HTTP via
+    POST /provisioning/reconcile-platform-secrets, see
+    routes/provisioning.py) and this handler is a thin wrapper around it,
+    mirroring ApplyPlatformBusTopology's exact shape."""
 
     def __init__(self, settings: Settings, runner: TerraformRunner | None = None):
         self._settings = settings
         self._runner = runner or get_runner()
+
+    async def ApplyPlatformSecrets(self, request, context):
+        pb2 = _platform_pb2()
+        started = time.monotonic()
+        try:
+            result = await self._runner.reconcile_platform_secrets(
+                PlatformSecretsInputs(env=request.env)
+            )
+            return pb2.ApplyPlatformSecretsResponse(
+                resources=_platform_secrets_resource_counts(result.outputs),
+                duration_ms=int((time.monotonic() - started) * 1000),
+                runner_summary=_summary(result.stdout),
+                exit_code=result.exit_code,
+            )
+        except TerraformError as exc:
+            await context.abort(
+                _terraform_error_code(exc), scrub_credentials(str(exc), self._settings)
+            )
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
     async def ApplyPlatformBusTopology(self, request, context):
         pb2 = _platform_pb2()
