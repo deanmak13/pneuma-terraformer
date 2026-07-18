@@ -351,7 +351,28 @@ async def test_get_tenant_state_returns_state_path_and_resources() -> None:
         f"s3://{settings.tf_state_backend_bucket}/tenants/t-004.tfstate"
     )
     assert response.last_applied_at == 0
-    context.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_tenant_state_runner_value_error_maps_to_invalid_argument() -> None:
+    """`_TENANT_ID_RE.fullmatch` only catches a malformed tenant_id
+    SHAPE -- the runner's `.state()` call can still raise ValueError for
+    a well-shaped but otherwise invalid id (e.g. no matching tenant
+    workspace). Mirrors every other ValueError->INVALID_ARGUMENT path in
+    this file."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.state.side_effect = ValueError("no workspace for tenant t-005")
+    servicer = ProvisioningService(settings, runner=runner)
+    request = provisioning_api_pb2.GetTenantStateRequest(tenant_id="t-005")
+    context = _fake_context()
+
+    with pytest.raises(_Abort):
+        await servicer.GetTenantState(request, context)
+
+    code, message = context.abort.await_args.args
+    assert code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "t-005" in message
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +633,15 @@ async def test_apply_platform_bus_topology_invalid_env_maps_to_invalid_argument(
 
 @pytest.mark.asyncio
 async def test_apply_platform_secrets_returns_resources_duration_and_summary() -> None:
+    """`outputs` mirrors the REAL platform-secrets module's 4 named
+    Terraform outputs (pneuma-deployments infrastructure/terraform/
+    modules/platform-secrets/outputs.tf) -- reconciled_target_paths
+    (list), canonical_source_paths (list), entry_count (int),
+    fanout_summary (target_path -> list of secret KEY NAMES, never
+    values). A fake shaped like `{path: "3"}` (the proto's aspirational
+    doc-comment shape, not what terraform output -json actually emits)
+    would pass a test without exercising the handler's real mapping
+    logic — see the BLOCKER this replaces."""
     settings = get_settings()
     runner = _fake_runner()
     runner.reconcile_platform_secrets.return_value = TerraformResult(
@@ -619,8 +649,18 @@ async def test_apply_platform_secrets_returns_resources_duration_and_summary() -
         stdout="...\nApply complete! Resources: 8 added, 2 changed, 0 destroyed.\n",
         stderr="",
         outputs={
-            "pneuma/platform/pneuma/tst/brain-api": "3",
-            "pneuma/platform/pneuma/tst/tenant-api": "5",
+            "reconciled_target_paths": [
+                "pneuma/platform/pneuma/tst/brain-api",
+                "pneuma/platform/pneuma/tst/tenant-api",
+            ],
+            "canonical_source_paths": ["pneuma/internal/tst/anthropic"],
+            "entry_count": 8,
+            "fanout_summary": {
+                "pneuma/platform/pneuma/tst/brain-api": ["ANTHROPIC_API_KEY"],
+                "pneuma/platform/pneuma/tst/tenant-api": [
+                    "STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET",
+                ],
+            },
         },
     )
     servicer = PlatformProvisioningService(settings, runner=runner)
@@ -635,10 +675,41 @@ async def test_apply_platform_secrets_returns_resources_duration_and_summary() -
     inputs = runner.reconcile_platform_secrets.await_args.args[0]
     assert inputs.env == "tst"
 
-    assert response.resources["pneuma/platform/pneuma/tst/brain-api"] == "3"
+    # Path -> reference-entry COUNT (proto contract), derived from
+    # fanout_summary's per-path key-name lists -- not the raw
+    # output-block-name/repr()-string garbage the old handler produced.
+    assert response.resources["pneuma/platform/pneuma/tst/brain-api"] == "1"
+    assert response.resources["pneuma/platform/pneuma/tst/tenant-api"] == "2"
+    assert "reconciled_target_paths" not in response.resources
+    assert "entry_count" not in response.resources
     assert response.exit_code == 0
     assert "Apply complete" in response.runner_summary
     assert response.duration_ms >= 0
+    context.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_secrets_missing_fanout_summary_returns_empty_resources() -> None:
+    """A malformed or missing `fanout_summary` output (e.g. a Terraform
+    module version drift, or a genuinely empty reconcile) must degrade
+    to an empty resources map, never raise -- resources is best-effort
+    audit metadata, not load-bearing for exit_code/duration_ms/
+    runner_summary, which the caller already relies on for success/
+    failure."""
+    settings = get_settings()
+    runner = _fake_runner()
+    runner.reconcile_platform_secrets.return_value = TerraformResult(
+        exit_code=0, stdout="no changes", stderr="",
+        outputs={"entry_count": 0},
+    )
+    servicer = PlatformProvisioningService(settings, runner=runner)
+    request = platform_provisioning_api_pb2.ApplyPlatformSecretsRequest(env="dev")
+    context = _fake_context()
+
+    response = await servicer.ApplyPlatformSecrets(request, context)
+
+    assert dict(response.resources) == {}
+    assert response.exit_code == 0
     context.abort.assert_not_awaited()
 
 

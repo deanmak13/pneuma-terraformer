@@ -31,6 +31,32 @@ def _string_map(values: dict[str, Any]) -> dict[str, str]:
     return {str(k): "" if v is None else str(v) for k, v in values.items()}
 
 
+def _platform_secrets_resource_counts(outputs: dict[str, Any]) -> dict[str, str]:
+    """Map `TerraformRunner.reconcile_platform_secrets`'s raw `terraform
+    output -json` dict to `ApplyPlatformSecretsResponse.resources`'
+    documented shape: target OpenBao path -> reference-entry count.
+
+    The platform-secrets module (pneuma-deployments infrastructure/
+    terraform/modules/platform-secrets/outputs.tf) exposes 4 named
+    outputs — `reconciled_target_paths` (list), `canonical_source_paths`
+    (list), `entry_count` (a single cluster-wide int), and
+    `fanout_summary` (a map of target_path -> list of secret KEY NAMES,
+    never values). Passing the raw outputs dict through `_string_map`
+    would stringify Terraform's 4 OUTPUT-BLOCK NAMES as keys with
+    Python `repr()`-style list/dict dumps as values — not the
+    per-path count map the proto promises. `fanout_summary` is the one
+    output with the right per-path granularity; this derives the count
+    from the length of each path's key list.
+    """
+    fanout_summary = outputs.get("fanout_summary")
+    if not isinstance(fanout_summary, dict):
+        return {}
+    return {
+        str(path): str(len(keys)) if isinstance(keys, list) else "0"
+        for path, keys in fanout_summary.items()
+    }
+
+
 async def _tenant_inputs(tenant_id: str, profile: str, workspace: str, settings: Settings) -> TenantInputs:
     if workspace and workspace != tenant_id:
         raise ValueError("workspace override is not supported by the current tenant module")
@@ -214,7 +240,7 @@ class PlatformProvisioningService(platform_provisioning_api_pb2_grpc.PlatformPro
                 PlatformSecretsInputs(env=request.env)
             )
             return pb2.ApplyPlatformSecretsResponse(
-                resources=_string_map(result.outputs),
+                resources=_platform_secrets_resource_counts(result.outputs),
                 duration_ms=int((time.monotonic() - started) * 1000),
                 runner_summary=_summary(result.stdout),
                 exit_code=result.exit_code,
