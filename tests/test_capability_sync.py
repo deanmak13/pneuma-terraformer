@@ -240,7 +240,7 @@ async def test_find_tenant_uses_control_schema_profile_header() -> None:
         assert request.headers["Content-Profile"] == "control"
         return httpx.Response(
             200,
-            json=[{"id": "t-1", "slug": "acme", "compliance_profile": "standard"}],
+            json=[{"id": "t-1", "slug": "acme", "compliance_profile": None}],
         )
 
     respx.get(f"{_BASE_URL}/tenants").mock(side_effect=_check)
@@ -251,7 +251,7 @@ async def test_find_tenant_uses_control_schema_profile_header() -> None:
     finally:
         await registry.aclose()
 
-    assert tenant == {"id": "t-1", "slug": "acme", "compliance_profile": "standard"}
+    assert tenant == {"id": "t-1", "slug": "acme", "compliance_profile": None}
 
 
 @pytest.mark.asyncio

@@ -79,7 +79,11 @@ async def _tenant_inputs(tenant_id: str, profile: str, workspace: str, settings:
         tenant_id=tenant_id,
         tenant_slug=tenant["slug"],
         env=settings.env,
-        compliance_profile=profile or tenant.get("compliance_profile") or "standard",
+        # Terraform's tenant module has no "standard" tier value — null is
+        # the non-regulated contract (see terraform_runner._normalize_profile).
+        # Neither an unset request field (proto3 "" sentinel) nor an unset
+        # tenant row should ever coerce to a literal string here.
+        compliance_profile=profile or tenant.get("compliance_profile") or None,
         pooled_namespace=settings.pneuma_namespace,
     )
 

@@ -18,12 +18,12 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def _payload() -> dict[str, str]:
+def _payload() -> dict[str, str | None]:
     return {
         "tenant_id": "t-001",
         "tenant_slug": "acme",
         "env": "tst",
-        "compliance_profile": "standard",
+        "compliance_profile": None,
         "pooled_namespace": "platform-tst",
     }
 

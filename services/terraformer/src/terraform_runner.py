@@ -50,13 +50,32 @@ _TENANT_MODULE = "tenant"
 _KUBE_SA_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _KUBE_SA_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 
+# The pneuma-deployments tenant module's `profile` variable (infrastructure/
+# terraform/modules/tenant/variables.tf) models "non-regulated" as `null` —
+# `default = null`, validated by `var.profile == null || contains(["gdpr-
+# special-uk", "fca-uk"], var.profile)`. There is no "standard" tier value
+# in that contract (confirmed by the matching `control.tenants.
+# compliance_profile` CHECK constraint in pneuma-engine, which likewise
+# only allows NULL / 'gdpr-special-uk' / 'fca-uk'). Any falsy value or the
+# legacy "standard" sentinel therefore normalizes to None here — the one
+# seam every caller's TenantInputs crosses on the way into the var-file —
+# so a caller or default that reintroduces the literal string can't break
+# `terraform apply` again.
+_NON_REGULATED_SENTINELS = frozenset({"", "standard"})
+
+
+def _normalize_profile(profile: str | None) -> str | None:
+    if profile is None:
+        return None
+    return None if profile.strip().lower() in _NON_REGULATED_SENTINELS else profile
+
 
 @dataclass(frozen=True)
 class TenantInputs:
     tenant_id: str
     tenant_slug: str
     env: str
-    compliance_profile: str
+    compliance_profile: str | None
     pooled_namespace: str
 
 
@@ -195,13 +214,13 @@ class TerraformRunner:
             "skip_requesting_account_id": "true",
         }
 
-    def _tf_vars(self, inputs: TenantInputs) -> dict[str, str]:
+    def _tf_vars(self, inputs: TenantInputs) -> dict[str, str | None]:
         s = self._settings
-        vars_ = {
+        vars_: dict[str, str | None] = {
             "tenant_id": inputs.tenant_id,
             "tenant_slug": inputs.tenant_slug,
             "env": inputs.env,
-            "profile": inputs.compliance_profile,
+            "profile": _normalize_profile(inputs.compliance_profile),
             "pooled_namespace": inputs.pooled_namespace,
             "postgres_superuser_password": s.postgres_superuser_password,
             "rabbitmq_admin_password": s.rabbitmq_admin_password,

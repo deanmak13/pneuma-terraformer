@@ -22,12 +22,12 @@ from services.terraformer.src.terraform_runner import (
 )
 
 
-def _stub_inputs() -> TenantInputs:
+def _stub_inputs(compliance_profile: str | None = "gdpr-special-uk") -> TenantInputs:
     return TenantInputs(
         tenant_id="t-001",
         tenant_slug="acme",
         env="tst",
-        compliance_profile="standard",
+        compliance_profile=compliance_profile,
         pooled_namespace="platform-tst",
     )
 
@@ -49,11 +49,45 @@ async def test_tf_vars_carry_inputs_and_creds() -> None:
     assert vars_["tenant_id"] == "t-001"
     assert vars_["tenant_slug"] == "acme"
     assert vars_["pooled_namespace"] == "platform-tst"
-    assert vars_["profile"] == "standard"
+    assert vars_["profile"] == "gdpr-special-uk"
     assert "compliance_profile" not in vars_
     assert "hetzner_api_token" not in vars_
     assert "cloudflare_api_token" not in vars_
     assert vars_["postgres_superuser_password"] == "pg-pass-1234"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_profile", [None, "", "standard", "STANDARD", "  standard  "])
+async def test_tf_vars_normalizes_non_regulated_sentinels_to_null_profile(
+    raw_profile: str | None,
+) -> None:
+    """Terraform's tenant module (infrastructure/terraform/modules/tenant/
+    variables.tf) validates `var.profile == null || contains(["gdpr-
+    special-uk", "fca-uk"], var.profile)` — there is no "standard" value.
+    None/""/"standard" (any case, whitespace) must all collapse to a real
+    `null` in the var-file, never the literal string "standard" — this is
+    the regression guard for the tenant-provisioning-fails-on-standard-
+    tenants incident (canary blocker #3)."""
+    settings = get_settings()
+    _seed_module(settings.terraform_modules_root)
+    runner = TerraformRunner(settings)
+    inputs = _stub_inputs(compliance_profile=raw_profile)
+
+    vars_ = runner._tf_vars(inputs)
+
+    assert vars_["profile"] is None
+
+
+@pytest.mark.asyncio
+async def test_tf_vars_preserves_regulated_profile_value() -> None:
+    settings = get_settings()
+    _seed_module(settings.terraform_modules_root)
+    runner = TerraformRunner(settings)
+    inputs = _stub_inputs(compliance_profile="fca-uk")
+
+    vars_ = runner._tf_vars(inputs)
+
+    assert vars_["profile"] == "fca-uk"
 
 
 @pytest.mark.asyncio
