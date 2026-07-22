@@ -112,7 +112,7 @@ async def test_run_tenant_reconcile_builds_inputs_and_returns_resources() -> Non
     )
     servicer = ProvisioningService(settings, runner=runner)
     request = provisioning_api_pb2.RunTenantReconcileRequest(
-        tenant_id="t-001", profile="standard",
+        tenant_id="t-001", profile="gdpr-special-uk",
     )
     context = _fake_context()
 
@@ -124,7 +124,7 @@ async def test_run_tenant_reconcile_builds_inputs_and_returns_resources() -> Non
     assert inputs.tenant_id == "t-001"
     assert inputs.tenant_slug == "acme-corp"
     assert inputs.env == settings.env
-    assert inputs.compliance_profile == "standard"
+    assert inputs.compliance_profile == "gdpr-special-uk"
     assert inputs.pooled_namespace == settings.pneuma_namespace
 
     assert response.resources["vhost"] == "/acme-tst"
@@ -136,10 +136,12 @@ async def test_run_tenant_reconcile_builds_inputs_and_returns_resources() -> Non
 
 
 @pytest.mark.asyncio
-async def test_run_tenant_reconcile_defaults_profile_to_standard() -> None:
+async def test_run_tenant_reconcile_defaults_profile_to_none() -> None:
     """An empty `profile` on the request AND an unset tenant
-    compliance_profile both fall back to "standard" — matches the HTTP
-    TenantRequest's default (routes/provisioning.py)."""
+    compliance_profile both fall back to None — matches the HTTP
+    TenantRequest's default (routes/provisioning.py). Terraform's tenant
+    module has no "standard" tier value; None is the non-regulated
+    contract (canary blocker #3 regression guard)."""
     settings = get_settings()
     runner = _fake_runner()
     runner.reconcile.return_value = TerraformResult(
@@ -153,7 +155,7 @@ async def test_run_tenant_reconcile_defaults_profile_to_standard() -> None:
         await servicer.RunTenantReconcile(request, context)
 
     inputs = runner.reconcile.await_args.args[0]
-    assert inputs.compliance_profile == "standard"
+    assert inputs.compliance_profile is None
 
 
 @pytest.mark.asyncio
@@ -165,7 +167,7 @@ async def test_run_tenant_reconcile_forwards_timeout_seconds_to_runner() -> None
     request = provisioning_api_pb2.RunTenantReconcileRequest(tenant_id="t-008", timeout_seconds=42)
     context = _fake_context()
 
-    with _patched_registry({"id": "t-008", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-008", "slug": "acme", "compliance_profile": None}):
         await servicer.RunTenantReconcile(request, context)
 
     assert runner.reconcile.await_args.kwargs["timeout"] == 42
@@ -183,7 +185,7 @@ async def test_run_tenant_reconcile_unset_timeout_seconds_forwards_none() -> Non
     request = provisioning_api_pb2.RunTenantReconcileRequest(tenant_id="t-009")
     context = _fake_context()
 
-    with _patched_registry({"id": "t-009", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-009", "slug": "acme", "compliance_profile": None}):
         await servicer.RunTenantReconcile(request, context)
 
     assert runner.reconcile.await_args.kwargs["timeout"] is None
@@ -208,7 +210,7 @@ async def test_run_tenant_destroy_returns_empty_destroyed_resources() -> None:
     request = provisioning_api_pb2.RunTenantDestroyRequest(tenant_id="t-003")
     context = _fake_context()
 
-    with _patched_registry({"id": "t-003", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-003", "slug": "acme", "compliance_profile": None}):
         response = await servicer.RunTenantDestroy(request, context)
 
     runner.destroy.assert_awaited_once()
@@ -230,7 +232,7 @@ async def test_run_tenant_destroy_forwards_timeout_seconds_to_runner() -> None:
     request = provisioning_api_pb2.RunTenantDestroyRequest(tenant_id="t-010", timeout_seconds=99)
     context = _fake_context()
 
-    with _patched_registry({"id": "t-010", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-010", "slug": "acme", "compliance_profile": None}):
         await servicer.RunTenantDestroy(request, context)
 
     assert runner.destroy.await_args.kwargs["timeout"] == 99
@@ -253,7 +255,7 @@ async def test_run_tenant_destroy_logs_audit_line_with_authorized_by_and_reason(
     )
     context = _fake_context()
 
-    with _patched_registry({"id": "t-011", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-011", "slug": "acme", "compliance_profile": None}):
         with caplog.at_level(logging.INFO, logger="terraformer.grpc"):
             await servicer.RunTenantDestroy(request, context)
 
@@ -279,7 +281,7 @@ async def test_run_tenant_destroy_error_scrubs_secret_and_maps_to_internal() -> 
     request = provisioning_api_pb2.RunTenantDestroyRequest(tenant_id="t-013")
     context = _fake_context()
 
-    with _patched_registry({"id": "t-013", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-013", "slug": "acme", "compliance_profile": None}):
         with pytest.raises(_Abort):
             await servicer.RunTenantDestroy(request, context)
 
@@ -319,7 +321,7 @@ async def test_run_tenant_destroy_logs_audit_line_even_when_unset(
     request = provisioning_api_pb2.RunTenantDestroyRequest(tenant_id="t-012")
     context = _fake_context()
 
-    with _patched_registry({"id": "t-012", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-012", "slug": "acme", "compliance_profile": None}):
         with caplog.at_level(logging.INFO, logger="terraformer.grpc"):
             await servicer.RunTenantDestroy(request, context)
 
@@ -403,7 +405,7 @@ async def test_reconcile_error_scrubs_secret_from_abort_message() -> None:
     request = provisioning_api_pb2.RunTenantReconcileRequest(tenant_id="t-005")
     context = _fake_context()
 
-    with _patched_registry({"id": "t-005", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-005", "slug": "acme", "compliance_profile": None}):
         with pytest.raises(_Abort):
             await servicer.RunTenantReconcile(request, context)
 
@@ -446,7 +448,7 @@ async def test_reconcile_timeout_maps_to_deadline_exceeded() -> None:
     request = provisioning_api_pb2.RunTenantReconcileRequest(tenant_id="t-006")
     context = _fake_context()
 
-    with _patched_registry({"id": "t-006", "slug": "acme", "compliance_profile": "standard"}):
+    with _patched_registry({"id": "t-006", "slug": "acme", "compliance_profile": None}):
         with pytest.raises(_Abort):
             await servicer.RunTenantReconcile(request, context)
 

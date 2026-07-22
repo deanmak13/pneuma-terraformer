@@ -49,8 +49,14 @@ class TenantRequest(BaseModel):
     tenant_id: str = Field(..., min_length=1, pattern=_TENANT_ID_PATTERN)
     tenant_slug: str = Field(..., min_length=1, pattern=_TENANT_ID_PATTERN)
     env: str = Field(..., min_length=1, pattern=r"^[a-z0-9][a-z0-9\-]{0,31}$")
-    compliance_profile: str = Field(
-        default="standard", pattern=r"^[a-z0-9][a-z0-9\-_]{0,31}$"
+    # Terraform's tenant module has no "standard" tier value — the
+    # non-regulated contract is `profile == null` (infrastructure/terraform/
+    # modules/tenant/variables.tf, mirrored by the control.tenants.
+    # compliance_profile CHECK constraint in pneuma-engine). Default to
+    # None, not a magic string; TerraformRunner._normalize_profile is the
+    # defense-in-depth seam for any caller that still sends "standard".
+    compliance_profile: str | None = Field(
+        default=None, pattern=r"^[a-z0-9][a-z0-9\-_]{0,31}$"
     )
     pooled_namespace: str = Field(..., min_length=1, pattern=_TENANT_ID_PATTERN)
 
