@@ -1251,7 +1251,14 @@ async def test_spawn_releases_semaphore_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The timeout/kill branch must not leak the semaphore permit — a
-    subsequent _spawn must still acquire (bounded wait, not a hang)."""
+    subsequent _spawn must still acquire (bounded wait, not a hang).
+    Uses timeout=1.2 (just above the 1s refuse-to-start floor — see
+    _MIN_RUN_SECONDS_AFTER_QUEUE) rather than a near-zero value: an
+    operation timeout below that floor now gets intercepted by the
+    refuse-to-start guard before ever spawning a process, which would
+    stop this test from exercising the actual kill()-on-timeout path it
+    means to cover. The real ~1.2s wait_for expiry below is a deliberate,
+    small, real-time cost to keep that coverage genuine."""
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
         terraform_modules_root=tmp_path / "modules",
@@ -1280,7 +1287,7 @@ async def test_spawn_releases_semaphore_on_timeout(
         return _HangingProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _hanging_exec)
-    result = await runner._spawn(workdir, ["apply"], timeout=0.01)
+    result = await runner._spawn(workdir, ["apply"], timeout=1.2)
     assert result.exit_code == 124
 
     class _FastProc:
@@ -1487,17 +1494,19 @@ async def test_spawn_reaps_subprocess_on_cancellation(
 async def test_spawn_acquire_times_out_when_saturated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A dispatch that cannot acquire a concurrency slot within
-    spawn_queue_timeout_seconds must fail fast with exit_code=124 rather
-    than hang — regression guard for finding B4: a read-only `terraform
-    output -json` (own timeout 30s) queuing behind a 600s apply could
-    otherwise hang for ~20 minutes."""
+    """A dispatch that cannot acquire a concurrency slot within its
+    (timeout-scaled) queue budget must fail fast with exit_code=124
+    rather than hang — regression guard for finding B4: a read-only
+    `terraform output -json` (own timeout 30s) queuing behind a 600s
+    apply could otherwise hang for ~20 minutes. spawn_queue_timeout_fraction
+    is driven near-zero so the 30s-timeout read's budget floors at 1s,
+    keeping this test fast without changing what it exercises."""
     settings = Settings(
         terraform_workdir_root=tmp_path / "wd",
         terraform_modules_root=tmp_path / "modules",
         terraform_binary="/bin/true",
         max_concurrent_terraform_runs=1,
-        spawn_queue_timeout_seconds=1,
+        spawn_queue_timeout_fraction=0.01,
     )
     settings.terraform_workdir_root.mkdir(parents=True)
     workdir = settings.terraform_workdir_root / "ws"
@@ -1557,6 +1566,267 @@ async def test_spawn_acquire_times_out_when_saturated(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
     third = await asyncio.wait_for(runner._spawn(workdir, ["apply"], timeout=5), timeout=1)
     assert third.exit_code == 0
+
+
+def test_spawn_queue_budget_scales_with_operation_timeout(tmp_path: Path) -> None:
+    """The queue budget must scale with the operation's OWN timeout, not
+    sit at a single flat value regardless of what kind of run it is —
+    assert the computed numbers directly, not just end-to-end behavior.
+    Default spawn_queue_timeout_fraction=0.5: a 30s read gets a 15s
+    budget, a 600s apply gets a 300s budget."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    runner = TerraformRunner(settings)
+    assert runner._spawn_queue_budget(30) == 15
+    assert runner._spawn_queue_budget(600) == 300
+    # Monotonic: a longer operation timeout never yields a smaller budget.
+    assert runner._spawn_queue_budget(600) > runner._spawn_queue_budget(30)
+
+
+def test_spawn_queue_budget_floors_at_one_second(tmp_path: Path) -> None:
+    """A very short operation timeout, or a near-zero fraction override,
+    must still get a real (if tiny) queue attempt rather than a 0s
+    budget that fails before ever trying to acquire."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        spawn_queue_timeout_fraction=0.01,
+    )
+    runner = TerraformRunner(settings)
+    assert runner._spawn_queue_budget(1) == 1
+    assert runner._spawn_queue_budget(30) == 1
+
+
+@pytest.mark.asyncio
+async def test_spawn_long_timeout_not_aborted_at_old_flat_45s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the actual shipped defect: the queue budget
+    for a 600s-timeout apply used to be a flat 45s, calibrated against
+    the WRONG assumption that every caller's gRPC deadline was ~60s —
+    the real provisioning caller configures 600s (onboarding_cycles.py
+    sets both the runner arg and the step timeout to 600, explicitly to
+    stop Temporal killing a legitimately-running apply early). A run
+    that merely queued behind others was aborted at 45s despite having
+    600s of caller budget. This test fails if the budget formula ever
+    reverts to that flat 45s — both at the formula level and by proving
+    `_spawn` actually hands the scaled budget (not a stale 45) to the
+    real acquire wait."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    budget_600 = runner._spawn_queue_budget(600)
+    assert budget_600 != 45
+    assert budget_600 > 45
+
+    class _FastProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FastProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+
+    captured_timeouts: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _spy_wait_for(fut, timeout=None, *a, **kw):
+        captured_timeouts.append(timeout)
+        return await real_wait_for(fut, timeout, *a, **kw)
+
+    monkeypatch.setattr(asyncio, "wait_for", _spy_wait_for)
+
+    result = await runner._spawn(workdir, ["apply"], timeout=600)
+    assert result.exit_code == 0
+    # First wait_for call inside _spawn is the semaphore-acquire budget —
+    # must be the scaled 300s, never the old flat 45s.
+    assert captured_timeouts[0] == budget_600 == 300
+    assert captured_timeouts[0] != 45
+
+
+def test_effective_run_timeout_deducts_queue_wait(tmp_path: Path) -> None:
+    """The caller's Temporal step timeout covers the WHOLE RPC — queue
+    wait included (onboarding_cycles.py deliberately aligns the step
+    timeout with the `timeout` value the runner receives) — so the run
+    must get what's LEFT of `timeout` after queuing, not `timeout` again
+    on top of it. queue_wait + run must never exceed the original
+    `timeout`."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    runner = TerraformRunner(settings)
+    assert runner._effective_run_timeout(600, 40.0) == 560
+    assert runner._effective_run_timeout(600, 0.0) == 600
+    # queue_wait + run == the original timeout, by construction.
+    queued = 40.0
+    assert queued + runner._effective_run_timeout(600, queued) == 600
+
+
+@pytest.mark.asyncio
+async def test_spawn_run_timeout_is_reduced_by_actual_queue_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integration proof that _spawn actually wires _effective_run_timeout
+    into the real subprocess wait: a call that spent 40s queuing on a
+    600s-timeout op must hand `proc.communicate()` a 560s budget, not the
+    full 600s again — otherwise queue_wait + run (640s) would exceed the
+    600s the caller is actually willing to wait, and Temporal would kill
+    the activity mid-apply. Drives the monotonic clock directly (like
+    test_spawn_logs_when_queued) so this doesn't need a real 40s sleep."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    class _FastProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FastProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+
+    # Fake time.monotonic() to simulate a 40s queue wait for a 600s-timeout
+    # call without a real sleep: the FIRST call (_spawn's `_t0` read)
+    # returns 0.0, every call after that returns 40.0. Clamping (rather
+    # than a finite iterator falling back to the real clock) matters
+    # because asyncio.wait_for's own deadline bookkeeping calls
+    # loop.time() -> time.monotonic() too, at least once, between our
+    # `_t0` read and our `_queued_s` read — a strict 2-value iterator
+    # would be consumed by that hidden call and hand our own
+    # `_queued_s` read a huge real-clock fallback value instead of 40.0.
+    real_monotonic = runner_mod.time.monotonic
+    _calls = {"n": 0}
+
+    def _fake_monotonic() -> float:
+        _calls["n"] += 1
+        return 0.0 if _calls["n"] == 1 else 40.0
+
+    monkeypatch.setattr(runner_mod.time, "monotonic", _fake_monotonic)
+
+    captured_timeouts: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _spy_wait_for(fut, timeout=None, *a, **kw):
+        captured_timeouts.append(timeout)
+        return await real_wait_for(fut, timeout, *a, **kw)
+
+    monkeypatch.setattr(asyncio, "wait_for", _spy_wait_for)
+
+    result = await runner._spawn(workdir, ["apply"], timeout=600)
+    assert result.exit_code == 0
+    # captured_timeouts[0] = semaphore-acquire budget (unaffected by the
+    # simulated queue wait — the real acquire didn't actually block).
+    # captured_timeouts[1] = the run timeout handed to proc.communicate(),
+    # which must be timeout(600) - queued(40) = 560, never 600 again.
+    assert captured_timeouts[1] == 560
+    # queue_wait + run never exceeds the caller's original budget.
+    assert 40.0 + captured_timeouts[1] == 600
+
+
+@pytest.mark.asyncio
+async def test_spawn_refuses_to_start_when_queue_wait_consumes_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the queue wait alone consumes (almost) the whole timeout
+    budget, _spawn must refuse to start the subprocess at all: starting
+    a long apply with only a few seconds left is strictly worse than not
+    starting it — it does real, partial, stateful work against the
+    tfstate and then gets killed mid-run anyway. Must return 124 WITHOUT
+    ever calling create_subprocess_exec."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    spawn_calls: list[tuple] = []
+
+    async def _must_not_be_called(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        raise AssertionError("terraform subprocess must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _must_not_be_called)
+
+    # timeout=30, simulate a 29.5s queue wait -> remaining=0.5s, below the
+    # 1s floor -> must refuse without ever reaching create_subprocess_exec.
+    # Clamp (rather than a finite iterator) past the first call: asyncio's
+    # own wait_for deadline bookkeeping also calls time.monotonic() at
+    # least once between our `_t0` and `_queued_s` reads, and a strict
+    # 2-value iterator would hand that hidden call the real clock instead.
+    _calls = {"n": 0}
+
+    def _fake_monotonic() -> float:
+        _calls["n"] += 1
+        return 0.0 if _calls["n"] == 1 else 29.5
+
+    monkeypatch.setattr(runner_mod.time, "monotonic", _fake_monotonic)
+
+    result = await runner._spawn(workdir, ["apply"], timeout=30)
+
+    assert result.exit_code == 124
+    assert "consumed" in result.stderr and "budget" in result.stderr
+    assert not spawn_calls, "must refuse before ever spawning the subprocess"
+
+    # No permit leaked by the refuse-to-start branch either.
+    class _FastProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FastProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+    second = await asyncio.wait_for(runner._spawn(workdir, ["apply"], timeout=5), timeout=1)
+    assert second.exit_code == 0
 
 
 @pytest.mark.asyncio

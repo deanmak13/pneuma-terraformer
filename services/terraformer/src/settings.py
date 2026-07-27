@@ -101,18 +101,26 @@ class Settings(BaseSettings):
     #: service would wedge with green health checks and no error logged.
     max_concurrent_terraform_runs: int = Field(default=2, ge=1)
 
-    #: Max seconds a terraform dispatch will wait to ACQUIRE a concurrency
-    #: slot before failing fast with exit_code=124 — bounds the wait, not
-    #: the run. Without this, a read-only `terraform output -json` (its
-    #: own timeout is 30s) can queue behind concurrent 600s applies for
-    #: up to ~20 minutes. Default kept below the ~60s per-attempt gRPC
-    #: deadline the cycle-executor sets on provisioning dispatches
-    #: (pneuma-engine services/cycle_executor/src/connectors/
-    #: grpc_internal.py:252, activities.py:746-752) so a saturated runner
-    #: fails cleanly from our own code — with a log line and a
-    #: TerraformResult — instead of the caller's transport silently
-    #: cancelling the handler with nothing in our logs.
-    spawn_queue_timeout_seconds: int = Field(default=45, ge=1)
+    #: Fraction of an operation's OWN timeout it may additionally spend
+    #: waiting to ACQUIRE a concurrency slot before failing fast with
+    #: exit_code=124 — bounds the wait, not the run. A single flat seconds
+    #: value cannot work here: it shipped once as 45s on the mistaken
+    #: belief that every caller's gRPC deadline was ~60s (pneuma-engine
+    #: services/cycle_executor/src/connectors/grpc_internal.py:252 is only
+    #: the FALLBACK default). The real provisioning caller configures 600s
+    #: (services/common/cycle_registries/onboarding_cycles.py sets both
+    #: `runner_timeout_seconds` and the step timeout to 600, explicitly to
+    #: avoid killing a legitimately-running apply early — "Align the
+    #: two"), so a flat 45s aborted a run that merely queued behind others
+    #: despite having 600s of caller budget. Deriving the budget from the
+    #: `timeout` _spawn already receives fixes this for every future
+    #: operation shape without a per-op constant: a 30s read still fails
+    #: fast, a 600s apply gets real room to wait for a slot, and total
+    #: time (queue-wait + run) is always bounded to `timeout * (1 +
+    #: fraction)`. gt=0/le=1: a value of 0 (or negative) would zero out
+    #: the wait entirely (indistinguishable from "never queue at all"),
+    #: and >1 would let queueing alone exceed the operation's own timeout.
+    spawn_queue_timeout_fraction: float = Field(default=0.5, gt=0, le=1.0)
 
     metrics_port: int = 9001
 

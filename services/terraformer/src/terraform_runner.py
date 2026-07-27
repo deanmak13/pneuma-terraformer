@@ -42,6 +42,19 @@ _LOG = logging.getLogger("terraformer.terraform")
 
 _TENANT_MODULE = "tenant"
 
+# Floor on the run time left after the queue wait, below which _spawn
+# refuses to start the subprocess at all (see _effective_run_timeout).
+# The caller's Temporal step timeout covers the WHOLE RPC — queue wait
+# included, deliberately aligned in pneuma-engine's onboarding_cycles.py
+# — so a run that spent nearly its whole budget queuing must not then
+# spend its last second starting `terraform apply` against real tfstate:
+# that does partial, stateful work and then gets killed anyway, which is
+# strictly worse than failing fast with nothing started. 1s is a
+# deliberately small floor — this guards the degenerate "queue wait ate
+# (almost) the whole budget" case, not a general minimum operation
+# timeout, so it only trips when there is truly no meaningful time left.
+_MIN_RUN_SECONDS_AFTER_QUEUE = 1
+
 # Kubernetes ServiceAccount projection paths — module-level constants
 # (not Settings fields) so tests can monkeypatch them directly onto this
 # module without threading a new Settings field through every call site.
@@ -182,6 +195,31 @@ class TerraformRunner:
             self._sem = asyncio.Semaphore(self._settings.max_concurrent_terraform_runs)
         return self._sem
 
+    def _spawn_queue_budget(self, timeout: int) -> int:
+        """Seconds a given `_spawn` call may wait to ACQUIRE a concurrency
+        slot before giving up with exit_code=124 — a fraction of that
+        call's OWN `timeout`, never a flat constant (see settings.py's
+        `spawn_queue_timeout_fraction` docstring for why a flat value
+        can't simultaneously suit a 30s read and a 600s apply). Floored
+        at 1s so a very short-timeout op still gets one real queue
+        attempt instead of a 0s budget that fails before ever trying."""
+        return max(1, int(timeout * self._settings.spawn_queue_timeout_fraction))
+
+    def _effective_run_timeout(self, timeout: int, queued_elapsed: float) -> float:
+        """Run-time budget remaining AFTER the queue wait is deducted from
+        the operation's own `timeout` — NOT the full `timeout` again.
+
+        The caller's Temporal step timeout covers the whole RPC, queue
+        wait included (onboarding_cycles.py deliberately aligns the step
+        timeout with the `timeout` value passed to us): if the run
+        budget were the full `timeout` on top of however long we already
+        queued, `queue_wait + run` could exceed what the caller is
+        actually willing to wait, and Temporal would kill the activity
+        mid-`apply` — burning a retry AND leaving partial infrastructure
+        work to reconcile. Deducting here keeps `queue_wait + run <=
+        timeout` always, by construction."""
+        return timeout - queued_elapsed
+
     def _workspace_dir(self, tenant_id: str) -> Path:
         """Resolve the per-tenant workspace path AND assert it is
         contained within ``terraform_workdir_root``. Defence-in-depth
@@ -310,10 +348,13 @@ class TerraformRunner:
         # below. Releasing early would bound nothing: that's the whole
         # point of the fix.
         #
-        # The acquire itself is ALSO bounded (spawn_queue_timeout_seconds):
-        # without that, a read-only `terraform output -json` (own timeout
-        # 30s) could queue behind concurrent 600s applies for ~20 minutes.
-        # A queue-timeout expiry never spawns a process, so there is
+        # The acquire itself is ALSO bounded, via a budget SCALED to this
+        # call's own `timeout` (see _spawn_queue_budget) — without that, a
+        # read-only `terraform output -json` (own timeout 30s) could queue
+        # behind concurrent 600s applies for ~20 minutes, while a flat
+        # budget short enough to stop that would in turn abort a 600s
+        # apply that merely queued behind another long-running apply. A
+        # queue-timeout expiry never spawns a process, so there is
         # nothing to reap on that branch — we just return exit_code=124.
         #
         # We do NOT use `async with sem:` here: a bounded acquire needs a
@@ -322,7 +363,7 @@ class TerraformRunner:
         # so the permit is released via an explicit `finally` below,
         # exactly once, only on the branch that actually acquired it.
         sem = self._spawn_semaphore()
-        queue_budget = self._settings.spawn_queue_timeout_seconds
+        queue_budget = self._spawn_queue_budget(timeout)
         if sem.locked():
             _LOG.info(
                 "tf spawn queued (waiting, limit=%d): workdir=%s cmd=%s",
@@ -360,13 +401,44 @@ class TerraformRunner:
                     "tf spawn queued %.1fs behind concurrency limit %d",
                     _queued_s, self._settings.max_concurrent_terraform_runs,
                 )
-            # Logged AFTER acquisition so this line reliably means "a
-            # process actually started" — moved here (from before the
-            # acquire) because the log signature that identified the
-            # 2026-07-27 OOMKill incident was six of these lines in 13s;
-            # logging before the acquire would keep printing one line per
-            # dispatch even once concurrency is bounded, misleading the
-            # next investigator into thinking the bound isn't working.
+
+            # The caller's Temporal step timeout covers the WHOLE RPC —
+            # queue wait included (deliberately aligned with `timeout` in
+            # pneuma-engine's onboarding_cycles.py) — so the run gets
+            # what's LEFT of `timeout` after queuing, never `timeout`
+            # again on top of it. If that leaves next to nothing, do not
+            # start the subprocess at all: a long `apply` given only a
+            # few seconds would do real, partial, stateful work against
+            # the tfstate and then get killed mid-run anyway — strictly
+            # worse than failing fast here with nothing started.
+            remaining = self._effective_run_timeout(timeout, _queued_s)
+            if remaining <= _MIN_RUN_SECONDS_AFTER_QUEUE:
+                _LOG.warning(
+                    "tf spawn refusing to start: queue wait %.1fs left only "
+                    "%.1fs of the %ds budget (floor=%ds): workdir=%s cmd=%s",
+                    _queued_s, remaining, timeout, _MIN_RUN_SECONDS_AFTER_QUEUE,
+                    workdir, safe_cmd,
+                )
+                return TerraformResult(
+                    exit_code=124,
+                    stdout="",
+                    stderr=(
+                        f"terraform {args[0]} queue wait ({_queued_s:.1f}s) "
+                        f"consumed the {timeout}s budget, leaving only "
+                        f"{remaining:.1f}s to run — refusing to start rather "
+                        f"than begin work that would be killed mid-run"
+                    ),
+                    outputs={},
+                )
+
+            # Logged AFTER acquisition (and the refuse-to-start check
+            # above) so this line reliably means "a process actually
+            # started" — moved here (from before the acquire) because the
+            # log signature that identified the 2026-07-27 OOMKill
+            # incident was six of these lines in 13s; logging before the
+            # acquire would keep printing one line per dispatch even once
+            # concurrency is bounded, misleading the next investigator
+            # into thinking the bound isn't working.
             _LOG.info("tf spawn: workdir=%s cmd=%s", workdir, safe_cmd)
 
             proc = await asyncio.create_subprocess_exec(
@@ -377,12 +449,15 @@ class TerraformRunner:
                 env=env,
             )
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=remaining)
             except asyncio.TimeoutError:
                 return TerraformResult(
                     exit_code=124,
                     stdout="",
-                    stderr=f"terraform {args[0]} timed out after {timeout}s",
+                    stderr=(
+                        f"terraform {args[0]} timed out after {remaining:.1f}s "
+                        f"(of {timeout}s budget; {_queued_s:.1f}s spent queuing)"
+                    ),
                     outputs={},
                 )
             finally:
