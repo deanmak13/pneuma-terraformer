@@ -87,14 +87,26 @@ jobs:
         id: tags
         env:
           GH_SHA: ${{ github.sha }}
+          DEPLOYMENTS_REF: ${{ steps.deployments_ref.outputs.ref }}
         run: |
           image="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
           short="${GH_SHA:0:7}"
           # No :latest tag — a floating tag on a baked-module image invites
           # silent drift between "what's deployed" and "what module shape
-          # it was baked from". Every consumer pins sha-<short>.
-          echo "tags=${image}:sha-${short}" >> "$GITHUB_OUTPUT"
-          echo "Tags: ${image}:sha-${short}"
+          # it was baked from".
+          #
+          # The tag must be content-addressed over BOTH inputs. This image is
+          # (terraformer source) + (pneuma-deployments Terraform modules baked
+          # in at build time), so tagging by the terraformer SHA alone let two
+          # DIFFERENT images share one tag whenever only the modules changed —
+          # exactly the drift the note above warns about. Observed 2026-07-27:
+          # a modules-only fix republished sha-d7b04c7 with a new digest, the
+          # running pod kept the old digest (pullPolicy IfNotPresent), and
+          # ArgoCD saw no change because the tag was identical.
+          tfshort="${DEPLOYMENTS_REF:0:7}"
+          tag="sha-${short}-tf${tfshort}"
+          echo "tags=${image}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${image}:${tag}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
