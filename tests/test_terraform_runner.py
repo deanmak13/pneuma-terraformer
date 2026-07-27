@@ -1407,3 +1407,224 @@ async def test_spawn_logs_when_queued(
     await runner._spawn(workdir, ["apply"], timeout=5)
 
     assert any("tf spawn queued" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_spawn_reaps_subprocess_on_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CancelledError (e.g. the gRPC caller's ~60s deadline firing —
+    grpc.aio cancels the server handler on expiry) must still reap the
+    subprocess before the permit is released. CancelledError is a
+    BaseException: pre-fix, only `except asyncio.TimeoutError` ran, so
+    cancellation left the process (and its ~5 provider children) alive
+    and unreaped while the freed permit let a queued run start — live
+    processes then silently exceeded the concurrency limit. Without the
+    `finally` this test's kill_calls stays empty."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=1,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    kill_calls: list[bool] = []
+
+    class _NeverEndingProc:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.sleep(10)  # cancelled long before this fires
+            return b"", b""
+
+        def kill(self) -> None:
+            kill_calls.append(True)
+            self.returncode = -9
+
+        async def wait(self) -> None:
+            return None
+
+    async def _never_ending_exec(*args, **kwargs):  # noqa: ARG001
+        return _NeverEndingProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_ending_exec)
+
+    task = asyncio.ensure_future(runner._spawn(workdir, ["apply"], timeout=600))
+    await asyncio.sleep(0.05)  # let _spawn acquire the permit and enter communicate()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert kill_calls, "cancelled _spawn must kill the still-running subprocess"
+
+    class _FastProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FastProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+    # If cancellation leaked the permit, this hangs forever (limit=1) —
+    # the outer wait_for turns that into a clean test failure.
+    second = await asyncio.wait_for(runner._spawn(workdir, ["apply"], timeout=5), timeout=1)
+    assert second.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_acquire_times_out_when_saturated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dispatch that cannot acquire a concurrency slot within
+    spawn_queue_timeout_seconds must fail fast with exit_code=124 rather
+    than hang — regression guard for finding B4: a read-only `terraform
+    output -json` (own timeout 30s) queuing behind a 600s apply could
+    otherwise hang for ~20 minutes."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=1,
+        spawn_queue_timeout_seconds=1,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    class _SlowProc:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.sleep(5)
+            self.returncode = 0
+            return b"", b""
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> None:
+            return None
+
+    async def _slow_exec(*args, **kwargs):  # noqa: ARG001
+        return _SlowProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _slow_exec)
+
+    busy_task = asyncio.ensure_future(runner._spawn(workdir, ["apply"], timeout=30))
+    await asyncio.sleep(0.05)  # let the busy call acquire the sole permit
+
+    # A second dispatch must fail fast (queue budget=1s) instead of
+    # waiting behind the still-running "apply" above.
+    saturated = await asyncio.wait_for(
+        runner._spawn(workdir, ["output", "-json"], timeout=30), timeout=3
+    )
+    assert saturated.exit_code == 124
+    assert "queued too long" in saturated.stderr
+
+    busy_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await busy_task
+
+    # No permit leaked by the timed-out acquire attempt.
+    class _FastProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FastProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+    third = await asyncio.wait_for(runner._spawn(workdir, ["apply"], timeout=5), timeout=1)
+    assert third.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_log_emitted_after_acquisition_not_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The 'tf spawn: ...' line must mean 'a process actually started' —
+    regression guard for finding B3. The log signature that identified the
+    2026-07-27 OOMKill incident was six 'tf spawn:' lines in 13s; logging
+    before the acquire would keep printing one line per dispatch even once
+    concurrency is bounded, misleading the next investigator. With the
+    limit saturated by a still-running call, a second, queued dispatch
+    must NOT log 'tf spawn:' until the first call frees the slot — and the
+    contended wait must log its own 'queued (waiting...)' line instead."""
+    import logging
+
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=1,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    release_first = asyncio.Event()
+
+    class _BlockingProc:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await release_first.wait()
+            self.returncode = 0
+            return b"", b""
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _blocking_exec(*args, **kwargs):  # noqa: ARG001
+        return _BlockingProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _blocking_exec)
+    caplog.set_level(logging.INFO, logger="terraformer.terraform")
+
+    first_task = asyncio.ensure_future(runner._spawn(workdir, ["apply"], timeout=30))
+    await asyncio.sleep(0.05)  # first call acquires the sole permit and logs "tf spawn:"
+
+    second_task = asyncio.ensure_future(runner._spawn(workdir, ["output", "-json"], timeout=30))
+    await asyncio.sleep(0.05)  # second call is now queued behind the first
+
+    spawn_lines_while_queued = [
+        r for r in caplog.records if r.getMessage().startswith("tf spawn: ")
+    ]
+    assert len(spawn_lines_while_queued) == 1, (
+        "only the running process may have logged 'tf spawn:' while the "
+        "second dispatch is still queued"
+    )
+    queued_lines = [r for r in caplog.records if "tf spawn queued (waiting" in r.getMessage()]
+    assert queued_lines, "a contended acquire must log the queued-waiting line"
+
+    release_first.set()
+    await asyncio.wait_for(first_task, timeout=1)
+    await asyncio.wait_for(second_task, timeout=1)
+
+    spawn_lines_final = [r for r in caplog.records if r.getMessage().startswith("tf spawn: ")]
+    assert len(spawn_lines_final) == 2

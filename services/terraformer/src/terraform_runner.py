@@ -282,11 +282,7 @@ class TerraformRunner:
             if arg == "-backend-config":
                 skip_next = True
             safe_args.append(arg)
-        _LOG.info(
-            "tf spawn: workdir=%s cmd=%s",
-            workdir,
-            shlex.join([self._settings.terraform_binary, *safe_args]),
-        )
+        safe_cmd = shlex.join([self._settings.terraform_binary, *safe_args])
 
         env = os.environ.copy()
         env["TF_IN_AUTOMATION"] = "1"
@@ -313,14 +309,65 @@ class TerraformRunner:
         # the FULL subprocess lifetime, including the timeout/kill branch
         # below. Releasing early would bound nothing: that's the whole
         # point of the fix.
+        #
+        # The acquire itself is ALSO bounded (spawn_queue_timeout_seconds):
+        # without that, a read-only `terraform output -json` (own timeout
+        # 30s) could queue behind concurrent 600s applies for ~20 minutes.
+        # A queue-timeout expiry never spawns a process, so there is
+        # nothing to reap on that branch — we just return exit_code=124.
+        #
+        # We do NOT use `async with sem:` here: a bounded acquire needs a
+        # manual try/except around `sem.acquire()` (to distinguish "never
+        # acquired, nothing to release" from "acquired, must release"),
+        # so the permit is released via an explicit `finally` below,
+        # exactly once, only on the branch that actually acquired it.
+        sem = self._spawn_semaphore()
+        queue_budget = self._settings.spawn_queue_timeout_seconds
+        if sem.locked():
+            _LOG.info(
+                "tf spawn queued (waiting, limit=%d): workdir=%s cmd=%s",
+                self._settings.max_concurrent_terraform_runs, workdir, safe_cmd,
+            )
         _t0 = time.monotonic()
-        async with self._spawn_semaphore():
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=queue_budget)
+        except asyncio.TimeoutError:
+            _LOG.warning(
+                "tf spawn queue timeout after %.1fs (budget=%ds, limit=%d): "
+                "workdir=%s cmd=%s",
+                time.monotonic() - _t0, queue_budget,
+                self._settings.max_concurrent_terraform_runs, workdir, safe_cmd,
+            )
+            return TerraformResult(
+                exit_code=124,
+                stdout="",
+                stderr=(
+                    f"terraform {args[0]} queued too long behind concurrent "
+                    f"terraform runs (waited >{queue_budget}s, limit="
+                    f"{self._settings.max_concurrent_terraform_runs})"
+                ),
+                outputs={},
+            )
+
+        # Permit acquired from here on — every path below must release it
+        # exactly once, including on cancellation (asyncio.CancelledError
+        # is a BaseException, not caught by any `except` clause here, so
+        # only a `finally` reliably runs on it).
+        try:
             _queued_s = time.monotonic() - _t0
             if _queued_s > 1.0:
                 _LOG.info(
                     "tf spawn queued %.1fs behind concurrency limit %d",
                     _queued_s, self._settings.max_concurrent_terraform_runs,
                 )
+            # Logged AFTER acquisition so this line reliably means "a
+            # process actually started" — moved here (from before the
+            # acquire) because the log signature that identified the
+            # 2026-07-27 OOMKill incident was six of these lines in 13s;
+            # logging before the acquire would keep printing one line per
+            # dispatch even once concurrency is bounded, misleading the
+            # next investigator into thinking the bound isn't working.
+            _LOG.info("tf spawn: workdir=%s cmd=%s", workdir, safe_cmd)
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -332,14 +379,23 @@ class TerraformRunner:
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
                 return TerraformResult(
                     exit_code=124,
                     stdout="",
                     stderr=f"terraform {args[0]} timed out after {timeout}s",
                     outputs={},
                 )
+            finally:
+                # ALWAYS reap, including on cancellation: a cancelled
+                # await (e.g. the gRPC caller's deadline expiring) raises
+                # CancelledError here, which only `asyncio.TimeoutError`
+                # above was catching pre-fix — leaving terraform and its
+                # ~5 provider children alive and unreaped while the freed
+                # permit let a queued run start, so live processes
+                # silently exceeded the concurrency limit.
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
 
             return TerraformResult(
                 exit_code=proc.returncode or 0,
@@ -347,6 +403,8 @@ class TerraformRunner:
                 stderr=stderr_b.decode("utf-8", errors="replace"),
                 outputs={},
             )
+        finally:
+            sem.release()
 
     async def _ensure_workspace(self, tenant_id: str) -> Path:
         workdir = self._workspace_dir(tenant_id)
