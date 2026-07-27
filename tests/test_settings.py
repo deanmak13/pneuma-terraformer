@@ -90,20 +90,34 @@ def test_max_concurrent_terraform_runs_accepts_positive_override(
     assert s.max_concurrent_terraform_runs == 5
 
 
-@pytest.mark.parametrize("bad_value", ["0", "-5"])
-def test_spawn_queue_timeout_seconds_rejects_non_positive(
+@pytest.mark.parametrize("bad_value", ["0", "-0.5", "1.5"])
+def test_spawn_queue_timeout_fraction_rejects_out_of_range(
     monkeypatch: pytest.MonkeyPatch, bad_value: str,
 ) -> None:
+    """gt=0/le=1 — a value of 0 (or negative) would zero out the queue
+    wait entirely (a caller could never wait for a slot at all), and a
+    value above 1 would let queueing alone exceed the operation's own
+    timeout. Both must be rejected at startup, not discovered at first
+    dispatch."""
     from pydantic import ValidationError
 
     from services.terraformer.src.settings import Settings
 
-    monkeypatch.setenv("SPAWN_QUEUE_TIMEOUT_SECONDS", bad_value)
+    monkeypatch.setenv("SPAWN_QUEUE_TIMEOUT_FRACTION", bad_value)
     with pytest.raises(ValidationError):
         Settings()
 
 
-def test_spawn_queue_timeout_seconds_default() -> None:
+def test_spawn_queue_timeout_fraction_default() -> None:
     from services.terraformer.src.settings import Settings
 
-    assert Settings().spawn_queue_timeout_seconds == 45
+    assert Settings().spawn_queue_timeout_fraction == 0.5
+
+
+def test_spawn_queue_timeout_fraction_accepts_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv("SPAWN_QUEUE_TIMEOUT_FRACTION", "0.25")
+    assert Settings().spawn_queue_timeout_fraction == 0.25
