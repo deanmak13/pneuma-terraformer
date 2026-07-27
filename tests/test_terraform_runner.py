@@ -1731,7 +1731,6 @@ async def test_spawn_run_timeout_is_reduced_by_actual_queue_wait(
     # `_t0` read and our `_queued_s` read — a strict 2-value iterator
     # would be consumed by that hidden call and hand our own
     # `_queued_s` read a huge real-clock fallback value instead of 40.0.
-    real_monotonic = runner_mod.time.monotonic
     _calls = {"n": 0}
 
     def _fake_monotonic() -> float:
