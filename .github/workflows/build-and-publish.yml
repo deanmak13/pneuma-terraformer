@@ -35,7 +35,16 @@ env:
   # TerraformRunner.reconcile_platform_bus_topology now reads from
   # settings.terraform_standalone_root at runtime. Without this bump the
   # baked image would lack that directory entirely.
-  DEPLOYMENTS_REF: d34df5c16018bfba24bd97a16609c571873eae5d
+  # Bumped 2026-07-28 to pick up the modules/tenant + modules/bootstrap
+  # null-profile validation fix. Terraform's `||` does NOT short-circuit,
+  # so `var.profile == null || contains([...], var.profile)` evaluated
+  # `contains(list, null)` and threw "argument must not be null" for every
+  # tenant without a compliance profile — i.e. every ordinary signup. The
+  # `? :` form (which DOES short-circuit) landed in pneuma-deployments but
+  # never reached the runner, because this pin still referenced the
+  # pre-fix commit. Live evidence: tenant 8b11192c failed `terraform apply`
+  # 2s after spawn on exactly that line.
+  DEPLOYMENTS_REF: 7260e1f9d573fb60c453efefbf779176573aaf19
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
