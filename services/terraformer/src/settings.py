@@ -91,6 +91,29 @@ class Settings(BaseSettings):
     apply_timeout_seconds: int = 600
     destroy_timeout_seconds: int = 600
 
+    #: Max terraform subprocesses running at once. Each run loads ~5 provider
+    #: plugins as child processes, so this is the process's real memory knob.
+    #: Unbounded spawning OOMKilled the pod (2026-07-27): six concurrent
+    #: applies in 13s against a 1Gi limit. Tunable per environment/pod size.
+    #: ge=1: this is projected via envFrom: configMapRef, so a values-file
+    #: typo of "0" is one edit away — asyncio.Semaphore(0) blocks every
+    #: acquire forever, and /health+/ready never touch the runner, so the
+    #: service would wedge with green health checks and no error logged.
+    max_concurrent_terraform_runs: int = Field(default=2, ge=1)
+
+    #: Max seconds a terraform dispatch will wait to ACQUIRE a concurrency
+    #: slot before failing fast with exit_code=124 — bounds the wait, not
+    #: the run. Without this, a read-only `terraform output -json` (its
+    #: own timeout is 30s) can queue behind concurrent 600s applies for
+    #: up to ~20 minutes. Default kept below the ~60s per-attempt gRPC
+    #: deadline the cycle-executor sets on provisioning dispatches
+    #: (pneuma-engine services/cycle_executor/src/connectors/
+    #: grpc_internal.py:252, activities.py:746-752) so a saturated runner
+    #: fails cleanly from our own code — with a log line and a
+    #: TerraformResult — instead of the caller's transport silently
+    #: cancelling the handler with nothing in our logs.
+    spawn_queue_timeout_seconds: int = Field(default=45, ge=1)
+
     metrics_port: int = 9001
 
     # Self-URL projected into capability_implementations.webhook_url at
