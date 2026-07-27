@@ -31,6 +31,7 @@ import logging
 import os
 import shlex
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -158,11 +159,28 @@ class TerraformRunner:
     def __init__(self, settings: Settings | None = None):
         self._settings = settings or get_settings()
         self._locks: dict[str, asyncio.Lock] = {}
+        # Lazily created (see _spawn_semaphore): an instance constructed
+        # outside a running event loop must not bind loop state at
+        # construction time.
+        self._sem: asyncio.Semaphore | None = None
 
     def _lock_for(self, tenant_id: str) -> asyncio.Lock:
         if tenant_id not in self._locks:
             self._locks[tenant_id] = asyncio.Lock()
         return self._locks[tenant_id]
+
+    def _spawn_semaphore(self) -> asyncio.Semaphore:
+        """Process-wide cap on concurrent terraform subprocesses (get_runner()
+        is a cached module-level singleton, so this one instance-level
+        semaphore bounds every init/apply/destroy/plan the process runs).
+        Each terraform run loads ~5 provider plugins as separate child
+        processes — unbounded spawning OOMKilled the pod (2026-07-27): six
+        concurrent applies within 13s against a 1Gi limit. Created lazily
+        so constructing a TerraformRunner outside a running event loop
+        doesn't bind loop state prematurely."""
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self._settings.max_concurrent_terraform_runs)
+        return self._sem
 
     def _workspace_dir(self, tenant_id: str) -> Path:
         """Resolve the per-tenant workspace path AND assert it is
@@ -291,31 +309,44 @@ class TerraformRunner:
         # listing or the redacted argv log line above.
         env.update(self._provider_env())
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(workdir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        # Bound concurrent subprocesses (see _spawn_semaphore) — held across
+        # the FULL subprocess lifetime, including the timeout/kill branch
+        # below. Releasing early would bound nothing: that's the whole
+        # point of the fix.
+        _t0 = time.monotonic()
+        async with self._spawn_semaphore():
+            _queued_s = time.monotonic() - _t0
+            if _queued_s > 1.0:
+                _LOG.info(
+                    "tf spawn queued %.1fs behind concurrency limit %d",
+                    _queued_s, self._settings.max_concurrent_terraform_runs,
+                )
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(workdir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return TerraformResult(
+                    exit_code=124,
+                    stdout="",
+                    stderr=f"terraform {args[0]} timed out after {timeout}s",
+                    outputs={},
+                )
+
             return TerraformResult(
-                exit_code=124,
-                stdout="",
-                stderr=f"terraform {args[0]} timed out after {timeout}s",
+                exit_code=proc.returncode or 0,
+                stdout=stdout_b.decode("utf-8", errors="replace"),
+                stderr=stderr_b.decode("utf-8", errors="replace"),
                 outputs={},
             )
-
-        return TerraformResult(
-            exit_code=proc.returncode or 0,
-            stdout=stdout_b.decode("utf-8", errors="replace"),
-            stderr=stderr_b.decode("utf-8", errors="replace"),
-            outputs={},
-        )
 
     async def _ensure_workspace(self, tenant_id: str) -> Path:
         workdir = self._workspace_dir(tenant_id)

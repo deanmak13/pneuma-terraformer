@@ -91,6 +91,12 @@ class Settings(BaseSettings):
     apply_timeout_seconds: int = 600
     destroy_timeout_seconds: int = 600
 
+    #: Max terraform subprocesses running at once. Each run loads ~5 provider
+    #: plugins as child processes, so this is the process's real memory knob.
+    #: Unbounded spawning OOMKilled the pod (2026-07-27): six concurrent
+    #: applies in 13s against a 1Gi limit. Tunable per environment/pod size.
+    max_concurrent_terraform_runs: int = 2
+
     metrics_port: int = 9001
 
     # Self-URL projected into capability_implementations.webhook_url at
