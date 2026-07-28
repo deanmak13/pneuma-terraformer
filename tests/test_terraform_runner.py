@@ -266,7 +266,7 @@ def test_scrub_credentials_redacts_known_secrets() -> None:
     from services.terraformer.src.terraform_runner import scrub_credentials
 
     settings = get_settings()
-    secret = settings.openbao_admin_token
+    secret = settings.rabbitmq_admin_password
     leaky = f"Error: failed to provision: invalid token={secret} response=403"
     assert secret not in scrub_credentials(leaky, settings)
     assert "<REDACTED>" in scrub_credentials(leaky, settings)
@@ -571,6 +571,121 @@ async def test_ensure_workspace_writes_backend_tf() -> None:
     assert 'backend "s3"' in backend_tf.read_text()
 
 
+# ---------------------------------------------------------------------------
+# Generated vault provider block (feat/openbao-k8s-auth) — replaces the
+# static VAULT_TOKEN. skip_child_token=true is LOAD-BEARING (without it the
+# provider calls auth/token/create even under auth_login_kubernetes, which
+# 403s against the least-privilege `terraformer` OpenBao policy); role/mount
+# must come from Settings, never a hardcoded literal (design-for-N — a
+# second cluster/role needs no code change).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_workspace_writes_vault_provider_file() -> None:
+    settings = get_settings()
+    _seed_module(settings.terraform_modules_root)
+    runner = TerraformRunner(settings)
+
+    workdir = await runner._ensure_workspace("t-vault-001")
+    provider_tf = workdir / "provider_vault.tf"
+    assert provider_tf.exists()
+    hcl = provider_tf.read_text()
+
+    assert "skip_child_token = true" in hcl
+    assert "auth_login_kubernetes" in hcl
+    assert f'role  = "{settings.vault_k8s_auth_role}"' in hcl
+    assert f'mount = "{settings.vault_k8s_auth_mount}"' in hcl
+    assert 'jwt = file("/var/run/secrets/kubernetes.io/serviceaccount/token")' in hcl
+
+
+@pytest.mark.asyncio
+async def test_vault_provider_role_and_mount_come_from_settings_not_literals(
+    tmp_path: Path,
+) -> None:
+    """Changing the setting must change the rendered HCL — proves role/
+    mount are threaded through, not baked-in literals."""
+    settings_a = Settings(
+        terraform_workdir_root=tmp_path / "wd-a",
+        terraform_modules_root=tmp_path / "modules-a",
+        terraform_binary="/bin/true",
+        vault_k8s_auth_role="terraformer",
+        vault_k8s_auth_mount="kubernetes",
+    )
+    _seed_module(settings_a.terraform_modules_root)
+    hcl_a = TerraformRunner(settings_a)._vault_provider_hcl()
+
+    settings_b = Settings(
+        terraform_workdir_root=tmp_path / "wd-b",
+        terraform_modules_root=tmp_path / "modules-b",
+        terraform_binary="/bin/true",
+        vault_k8s_auth_role="a-second-cluster-role",
+        vault_k8s_auth_mount="kubernetes-secondary",
+    )
+    _seed_module(settings_b.terraform_modules_root)
+    hcl_b = TerraformRunner(settings_b)._vault_provider_hcl()
+
+    assert hcl_a != hcl_b
+    assert 'role  = "a-second-cluster-role"' in hcl_b
+    assert 'mount = "kubernetes-secondary"' in hcl_b
+    assert "a-second-cluster-role" not in hcl_a
+
+
+@pytest.mark.asyncio
+async def test_ensure_platform_secrets_workspace_writes_vault_provider_file(
+    tmp_path: Path,
+) -> None:
+    """platform-secrets-apply provisions vault_kv_secret_v2 resources via
+    the same OpenBao connection — it must get the identical generated
+    provider file as the tenant workspace (see terraform_runner.py's
+    _ensure_platform_workspace comment on why this requires the
+    companion pneuma-deployments harness to drop its own hardcoded
+    `provider "vault" {}` block from main.tf)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    standalone_src = settings.terraform_standalone_root / "platform-secrets-apply"
+    standalone_src.mkdir(parents=True)
+    (standalone_src / "main.tf").write_text("# stub\n")
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    workdir = await runner._ensure_platform_workspace("tst")
+
+    provider_tf = workdir / "provider_vault.tf"
+    assert provider_tf.exists()
+    assert "skip_child_token = true" in provider_tf.read_text()
+
+
+@pytest.mark.asyncio
+async def test_ensure_platform_bus_topology_workspace_has_no_vault_provider_file(
+    tmp_path: Path,
+) -> None:
+    """platform-bus-topology-apply's only provider is rabbitmq (confirmed
+    against pneuma-deployments' standalone harness — no vault provider
+    block at all) — it must NOT get a generated provider_vault.tf; that
+    file would declare a provider the harness's required_providers never
+    lists, which Terraform rejects."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    standalone_src = settings.terraform_standalone_root / "platform-bus-topology-apply"
+    standalone_src.mkdir(parents=True)
+    (standalone_src / "main.tf").write_text("# stub\n")
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    workdir = await runner._ensure_platform_bus_topology_workspace("tst")
+
+    assert not (workdir / "provider_vault.tf").exists()
+
+
 def test_module_var_files_absent_returns_empty_list(tmp_path: Path) -> None:
     settings = get_settings()
     runner = TerraformRunner(settings)
@@ -731,7 +846,7 @@ async def test_reconcile_platform_secrets_wipes_terraform_tfvars_json(tmp_path: 
     assert not tfvars.exists(), "terraform.tfvars.json must be wiped after platform-secrets reconcile"
 
 
-def test_provider_env_includes_five_credential_vars() -> None:
+def test_provider_env_includes_four_credential_vars() -> None:
     settings = get_settings()
     runner = TerraformRunner(settings)
 
@@ -740,7 +855,19 @@ def test_provider_env_includes_five_credential_vars() -> None:
     assert env["RABBITMQ_PASSWORD"] == settings.rabbitmq_admin_password
     assert env["MINIO_USER"] == settings.tf_state_backend_access_key
     assert env["MINIO_PASSWORD"] == settings.minio_admin_password
-    assert env["VAULT_TOKEN"] == settings.openbao_admin_token
+
+
+def test_provider_env_no_longer_exports_vault_token() -> None:
+    """OpenBao auth moved to auth_login_kubernetes (generated
+    provider_vault.tf) — the runner must never source a static
+    VAULT_TOKEN from Settings again. A silent fallback to a stored
+    token is exactly the failure class this fix removes."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    env = runner._provider_env()
+    assert "VAULT_TOKEN" not in env
+    assert not hasattr(settings, "openbao_admin_token")
 
 
 def test_provider_env_excludes_kube_vars_when_sa_files_absent(
@@ -813,7 +940,41 @@ async def test_spawn_sets_tf_cli_config_file_and_provider_env(tmp_path: Path) ->
     assert captured_env["AWS_ACCESS_KEY_ID"] == settings.tf_state_backend_access_key
     assert captured_env["AWS_SECRET_ACCESS_KEY"] == settings.tf_state_backend_secret_key
     assert captured_env["PGPASSWORD"] == settings.postgres_superuser_password
-    assert captured_env["VAULT_TOKEN"] == settings.openbao_admin_token
+
+
+@pytest.mark.asyncio
+async def test_spawn_env_keeps_vault_addr_but_drops_vault_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VAULT_ADDR is env-invariant cluster config (configmap-sourced, not
+    a secret) — it must keep reaching the subprocess via the ambient
+    `os.environ.copy()` in _spawn even after VAULT_TOKEN retirement.
+    VAULT_TOKEN must NEVER appear, from Settings or anywhere else — a
+    static token is the failure class this fix removes; there is no
+    fallback path that could reintroduce it."""
+    monkeypatch.setenv("VAULT_ADDR", "http://openbao.platform-tst.svc.cluster.local:8200")
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/usr/bin/env",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    captured_env: dict[str, str] = {}
+    orig_create_subprocess_exec = __import__("asyncio").create_subprocess_exec
+
+    async def _capturing_exec(*args, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        return await orig_create_subprocess_exec(*args, **kwargs)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_capturing_exec):
+        await runner._spawn(workdir, ["--version"], timeout=5)
+
+    assert captured_env["VAULT_ADDR"] == "http://openbao.platform-tst.svc.cluster.local:8200"
+    assert "VAULT_TOKEN" not in captured_env
 
 
 @pytest.mark.asyncio

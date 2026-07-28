@@ -24,7 +24,6 @@ _REQUIRED_ENV = {
     "POSTGRES_SUPERUSER_PASSWORD": "pg-pass-1234",
     "RABBITMQ_ADMIN_PASSWORD": "rmq-pass-1234",
     "MINIO_ADMIN_PASSWORD": "minio-pass-1234",
-    "OPENBAO_ADMIN_TOKEN": "bao-token-1234",
 }
 
 

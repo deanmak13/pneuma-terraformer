@@ -121,3 +121,51 @@ def test_spawn_queue_timeout_fraction_accepts_override(
 
     monkeypatch.setenv("SPAWN_QUEUE_TIMEOUT_FRACTION", "0.25")
     assert Settings().spawn_queue_timeout_fraction == 0.25
+
+
+# ---------------------------------------------------------------------------
+# OpenBao kubernetes-auth role/mount (feat/openbao-k8s-auth) — replaces the
+# static OPENBAO_ADMIN_TOKEN that expired and 403'd every tenant apply.
+# Settings has no such field any more; role/mount must be present, non-empty,
+# and never a hardcoded literal in the generated HCL (see terraform_runner
+# tests for the rendered-HCL-changes-with-settings assertion).
+# ---------------------------------------------------------------------------
+
+
+def test_openbao_admin_token_field_removed() -> None:
+    from services.terraformer.src.settings import Settings
+
+    assert not hasattr(Settings(), "openbao_admin_token")
+
+
+def test_vault_k8s_auth_role_and_mount_defaults() -> None:
+    from services.terraformer.src.settings import Settings
+
+    s = Settings()
+    assert s.vault_k8s_auth_role == "terraformer"
+    assert s.vault_k8s_auth_mount == "kubernetes"
+
+
+def test_vault_k8s_auth_role_and_mount_accept_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv("VAULT_K8S_AUTH_ROLE", "terraformer-prod")
+    monkeypatch.setenv("VAULT_K8S_AUTH_MOUNT", "kubernetes-prod")
+    s = Settings()
+    assert s.vault_k8s_auth_role == "terraformer-prod"
+    assert s.vault_k8s_auth_mount == "kubernetes-prod"
+
+
+@pytest.mark.parametrize("env_var", ["VAULT_K8S_AUTH_ROLE", "VAULT_K8S_AUTH_MOUNT"])
+def test_vault_k8s_auth_role_and_mount_reject_empty(
+    monkeypatch: pytest.MonkeyPatch, env_var: str,
+) -> None:
+    from pydantic import ValidationError
+
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv(env_var, "")
+    with pytest.raises(ValidationError):
+        Settings()

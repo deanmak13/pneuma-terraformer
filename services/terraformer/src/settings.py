@@ -86,7 +86,27 @@ class Settings(BaseSettings):
     postgres_superuser_password: str = Field(..., min_length=8)
     rabbitmq_admin_password: str = Field(..., min_length=8)
     minio_admin_password: str = Field(..., min_length=8)
-    openbao_admin_token: str = Field(..., min_length=8)
+
+    # OpenBao auth: kubernetes auth, NOT a stored token. A static
+    # OPENBAO_ADMIN_TOKEN (the previous design) expired silently and
+    # 403'd every tenant apply at `auth/token/lookup-self` — a stored
+    # token is the failure class, not a particular expiry date. These two
+    # fields are rendered into the generated `provider_vault.tf` written
+    # into every workspace (see terraform_runner._vault_provider_hcl) —
+    # never hardcoded in the HCL string, so a second cluster/role needs
+    # no code change (design-for-N). They must match the companion
+    # OpenBao `vault_kubernetes_auth_backend_role` (role_name) and
+    # `vault_kubernetes_auth_backend` (mount `backend`) resources.
+    vault_k8s_auth_role: str = Field(
+        default="terraformer",
+        min_length=1,
+        description="OpenBao Kubernetes auth backend role this pod authenticates as.",
+    )
+    vault_k8s_auth_mount: str = Field(
+        default="kubernetes",
+        min_length=1,
+        description="Mount path of the OpenBao Kubernetes auth backend.",
+    )
 
     apply_timeout_seconds: int = 600
     destroy_timeout_seconds: int = 600
