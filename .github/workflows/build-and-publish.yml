@@ -55,7 +55,14 @@ env:
   # and the consuming pin never moves, so the merge looks successful and the
   # running system is unchanged. Anything added under infrastructure/terraform/
   # that this image must execute requires bumping this ref in the same wave.
-  DEPLOYMENTS_REF: 30fd31d8834214cf7c44a853efc0d3d70381c2f0
+  #
+  # Bumped 2026-07-28 for pneuma-deployments#1372: modules/tenant/variables.tf
+  # named RabbitMQ users that do not exist (gateway/brain/worker, missing the
+  # broker's `pneuma-` prefix; rabbitmq_admin_user = "admin"). Every tenant
+  # apply failed on rabbitmq_permissions.bus_service["worker"] with
+  # `Error 400 (bad_request): vhost_or_user_not_found`. The module defaults
+  # are baked into this image, so the fix is inert until this ref moves.
+  DEPLOYMENTS_REF: 541b18e3b440963909389aadac6912596720a845
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
