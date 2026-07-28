@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -681,6 +683,68 @@ def test_auth_mount_is_slash_normalised(tmp_path: Path, raw: str, expected: str)
         f'path = "auth/{expected}/login"'
         in TerraformRunner(settings)._vault_provider_hcl()
     )
+
+
+@pytest.mark.skipif(
+    shutil.which("terraform") is None,
+    reason="terraform not on PATH; CI installs it (see .github/workflows/pr-checks.yml)",
+)
+def test_generated_vault_provider_hcl_passes_real_terraform_validate(
+    tmp_path: Path,
+) -> None:
+    """The ONE assertion here that the provider, not we, get to make.
+
+    Every other test in this file string-matches the generator's output
+    against itself — they can confirm what we wrote, never that the
+    provider accepts it. That gap shipped a `provider "vault"` block named
+    `auth_login_kubernetes`, which does not exist: the suite stayed green
+    while 100% of tenant provisioning runs died at provider-parse time and
+    tenants sat in lifecycle_state=provisioning until the caller timed out
+    (2026-07-28). Hand the rendered file to the real toolchain and let it
+    reject an invented block name or argument.
+
+    No backend, no state, no credentials — schema validation only.
+    """
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    _seed_module(settings.terraform_modules_root)
+
+    work = tmp_path / "hclcheck"
+    work.mkdir()
+    (work / "provider_vault.tf").write_text(
+        TerraformRunner(settings)._vault_provider_hcl()
+    )
+    # Kept in lockstep with the baked tenant module's versions.tf — if the
+    # two drift this guard stops reflecting the provider that actually runs.
+    (work / "versions.tf").write_text(
+        "terraform {\n"
+        "  required_providers {\n"
+        "    vault = {\n"
+        '      source  = "hashicorp/vault"\n'
+        '      version = "~> 4.2"\n'
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+    for args, timeout in (
+        (["init", "-backend=false", "-input=false", "-no-color"], 300),
+        (["validate", "-no-color"], 120),
+    ):
+        proc = subprocess.run(
+            ["terraform", *args],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        assert proc.returncode == 0, (
+            f"`terraform {args[0]}` rejected the generated provider block:\n"
+            f"{proc.stdout}\n{proc.stderr}"
+        )
 
 
 @pytest.mark.parametrize("raw", ["/", "//", "   "])

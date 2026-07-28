@@ -72,6 +72,18 @@ jobs:
       - name: mypy
         run: mypy services/
 
+      # Puts the real `terraform` binary on PATH for the pytest run.
+      # test_generated_vault_provider_hcl_passes_real_terraform_validate
+      # skips itself when terraform is absent (so a local run stays fast),
+      # which means CI is the place that must always have it. Without this
+      # step that guard silently no-ops and the 2026-07-28 class of bug —
+      # generated HCL naming a block the provider does not define — sails
+      # through green again.
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
       - name: pytest
         run: |
           pytest tests/ \
