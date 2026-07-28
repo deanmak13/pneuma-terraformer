@@ -7,6 +7,7 @@ are mocked via respx — never live.
 from __future__ import annotations
 
 import base64
+import logging
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -24,6 +25,7 @@ from services.terraformer.src.terraform_runner import (
     TerraformResult,
     TerraformRunner,
 )
+from tests.conftest import DUMMY_CA_PEM as _DUMMY_CA_PEM
 
 _VAULT_ADDR = "http://openbao.openbao.test:8200"
 _LOGIN_URL = f"{_VAULT_ADDR}/v1/auth/kubernetes/login"
@@ -31,34 +33,6 @@ _ATTEMPT_URL = f"{_VAULT_ADDR}/v1/sys/generate-root/attempt"
 _UPDATE_URL = f"{_VAULT_ADDR}/v1/sys/generate-root/update"
 _DECODE_URL = f"{_VAULT_ADDR}/v1/sys/decode-token"
 _REVOKE_URL = f"{_VAULT_ADDR}/v1/auth/token/revoke-self"
-
-# A real (self-signed, throwaway) PEM — httpx's `verify=<path>` eagerly
-# parses the CA file at AsyncClient construction time even under respx
-# mocking (no real TLS handshake ever happens, but the SSLContext is still
-# built), so a placeholder string like "fake-ca" raises ssl.SSLError
-# before respx gets a chance to intercept anything. Any structurally valid
-# certificate works here — content is never actually validated against a
-# live connection in these tests.
-_DUMMY_CA_PEM = """-----BEGIN CERTIFICATE-----
-MIIDBTCCAe2gAwIBAgIUZ6WeT6cBvb9ObIpek1g8rurn2OAwDQYJKoZIhvcNAQEL
-BQAwEjEQMA4GA1UEAwwHdGVzdC1jYTAeFw0yNjA3MjgyMDE2MzhaFw0zNjA3MjUy
-MDE2MzhaMBIxEDAOBgNVBAMMB3Rlc3QtY2EwggEiMA0GCSqGSIb3DQEBAQUAA4IB
-DwAwggEKAoIBAQDDNiKmiSJC4/uh4FQSA3AMqDCUbglaTWNd8kTi1kpTgPHMNnMm
-nV3PVaTKoHG41ieNf2yM4TYly5h3LMTR5BEak1ZsCRMsvqEJYHgdHe98ZPjZ6gCW
-+ruAd7WUytype5hZe0+oZUwJ2pBbDYr/7eNdmQaFoenyp5FnHh5zwTtTyCMPT4x4
-vuRfi8rbWfLzZAB2BFvS5Sj79YRHgE7jbFxt39vMpiemRcu5WTZjN/2rVdNDz17T
-AoSInRcTJ4io7IqJ7SzjlQVG0RrbCg3COsOyHKonbZwWeIMViS1Ka7RiFmLfFyr/
-OluYfCmsLgZRASDognsjElYzvMZDc9E6ZP9fAgMBAAGjUzBRMB0GA1UdDgQWBBRr
-wU0ORE8DO9ZTDg1zDYS6qItczDAfBgNVHSMEGDAWgBRrwU0ORE8DO9ZTDg1zDYS6
-qItczDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBT+3FE53ED
-ObHiyqlOdQ5xmM9wtofVNBhZYohIwfRXxA8o5hRiIynVrXomUw5rTxcogDm2bSfz
-y8yoRpBcWu6E88H+Www+4my6jMqI20wQNSDOuCrfLC3idHd+xX4N1OdP43VILMqp
-5Rat3pI7x9h6Yc6qpJ7QJKN+PyubBtWlNgs17ppZ/HWzqMTnRvaht6mjCZUZQTnS
-gQ6K/wyHP+8nl2IzVFfEInYk6UTp7DObscEc2ZKL4nfANYkrhGCEO6Wi0M7jZ2rs
-qkWObyszYQdfHMJEKMxBo1PR/iSiuX3FVr1gwD4sVmVHo+wVBRK7c7fbUOuukGQD
-JnaJVLtL5gHm
------END CERTIFICATE-----
-"""
 
 
 def _settings(**overrides) -> Settings:
@@ -293,3 +267,208 @@ async def test_read_namespaced_secret_decodes_base64_values(
         result = await k8s_api.read_namespaced_secret("openbao", "openbao-bootstrap")
 
     assert result == {"UNSEAL_KEY_1": "unseal-share-1"}
+
+
+# ---------------------------------------------------------------------------
+# Login-probe transport failure — must fall through to break-glass, never
+# raise (a network hiccup on the probe is not proof OpenBao is down; the
+# break-glass path's own calls will surface a clear error if it genuinely
+# is).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_ensure_platform_auth_breaks_glass_when_login_probe_unreachable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    _fake_jwt(monkeypatch, tmp_path)
+    _fake_unseal_secret(monkeypatch)
+    settings = _settings()
+    runner = TerraformRunner(settings)
+
+    # First probe raises a transport error (not an HTTP error response) —
+    # _k8s_login_ok must swallow it and report False; second (post-apply)
+    # probe succeeds.
+    login_route = respx.post(_LOGIN_URL).mock(
+        side_effect=[httpx.ConnectError("connection refused"), httpx.Response(200, json={})]
+    )
+    respx.post(_ATTEMPT_URL).mock(
+        return_value=httpx.Response(200, json={"nonce": "n-1", "otp": "otp-value"})
+    )
+    respx.post(_UPDATE_URL).mock(
+        return_value=httpx.Response(200, json={"complete": True, "encoded_token": "encoded-abc"})
+    )
+    respx.post(_DECODE_URL).mock(
+        return_value=httpx.Response(200, json={"data": {"token": "s.root-token-xyz"}})
+    )
+    respx.post(_REVOKE_URL).mock(return_value=httpx.Response(204))
+
+    apply_result = TerraformResult(exit_code=0, stdout="applied", stderr="", outputs={})
+    with patch.object(runner, "apply_platform_auth", AsyncMock(return_value=apply_result)):
+        action = await ensure_platform_auth(settings, runner)
+
+    assert action == "break_glass_applied"
+    assert login_route.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Unseal-share Secret missing a configured key — specific, actionable error.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_read_unseal_shares_raises_when_a_share_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """settings.openbao_unseal_key_count defaults to 3, but the Secret only
+    carries 2 UNSEAL_KEY_N entries — _read_unseal_shares must raise, naming
+    the specific missing key, rather than submit an incomplete share set to
+    generate-root/update."""
+    _fake_jwt(monkeypatch, tmp_path)
+    _fake_unseal_secret(monkeypatch, count=2)
+    settings = _settings()
+    runner = TerraformRunner(settings)
+
+    respx.post(_LOGIN_URL).mock(return_value=httpx.Response(400, json={}))
+
+    with pytest.raises(PlatformAuthBootstrapError, match="UNSEAL_KEY_3"):
+        await ensure_platform_auth(settings, runner)
+
+
+# ---------------------------------------------------------------------------
+# generate-root HTTP-flow edge cases that must refuse to proceed rather
+# than mint/return a broken or empty root token.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_generate_root_raises_when_complete_but_no_encoded_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    _fake_jwt(monkeypatch, tmp_path)
+    _fake_unseal_secret(monkeypatch)
+    settings = _settings()
+    runner = TerraformRunner(settings)
+
+    respx.post(_LOGIN_URL).mock(return_value=httpx.Response(400, json={}))
+    respx.post(_ATTEMPT_URL).mock(
+        return_value=httpx.Response(200, json={"nonce": "n-1", "otp": "otp-value"})
+    )
+    # complete=True but no encoded_token — malformed/unexpected OpenBao
+    # response shape.
+    respx.post(_UPDATE_URL).mock(return_value=httpx.Response(200, json={"complete": True}))
+
+    with pytest.raises(PlatformAuthBootstrapError, match="no encoded_token"):
+        await ensure_platform_auth(settings, runner)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_generate_root_raises_when_decoded_token_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    _fake_jwt(monkeypatch, tmp_path)
+    _fake_unseal_secret(monkeypatch)
+    settings = _settings()
+    runner = TerraformRunner(settings)
+
+    respx.post(_LOGIN_URL).mock(return_value=httpx.Response(400, json={}))
+    respx.post(_ATTEMPT_URL).mock(
+        return_value=httpx.Response(200, json={"nonce": "n-1", "otp": "otp-value"})
+    )
+    respx.post(_UPDATE_URL).mock(
+        return_value=httpx.Response(200, json={"complete": True, "encoded_token": "encoded-abc"})
+    )
+    # decode-token responds 200 but hands back an empty token string.
+    respx.post(_DECODE_URL).mock(
+        return_value=httpx.Response(200, json={"data": {"token": ""}})
+    )
+
+    with pytest.raises(PlatformAuthBootstrapError, match="empty root token"):
+        await ensure_platform_auth(settings, runner)
+
+
+# ---------------------------------------------------------------------------
+# Revoke-self failures — always logged, NEVER allowed to raise or mask the
+# apply outcome (see _revoke_token's docstring: a live-until-TTL token plus
+# a loud log line beats losing the real apply result).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_revoke_transport_failure_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _fake_jwt(monkeypatch, tmp_path)
+    _fake_unseal_secret(monkeypatch)
+    settings = _settings()
+    runner = TerraformRunner(settings)
+
+    respx.post(_LOGIN_URL).mock(
+        side_effect=[httpx.Response(400, json={}), httpx.Response(200, json={})]
+    )
+    respx.post(_ATTEMPT_URL).mock(
+        return_value=httpx.Response(200, json={"nonce": "n-1", "otp": "otp-value"})
+    )
+    respx.post(_UPDATE_URL).mock(
+        return_value=httpx.Response(200, json={"complete": True, "encoded_token": "encoded-abc"})
+    )
+    respx.post(_DECODE_URL).mock(
+        return_value=httpx.Response(200, json={"data": {"token": "s.root-token-xyz"}})
+    )
+    revoke_route = respx.post(_REVOKE_URL).mock(side_effect=httpx.ConnectError("network unreachable"))
+
+    apply_result = TerraformResult(exit_code=0, stdout="applied", stderr="", outputs={})
+    with patch.object(runner, "apply_platform_auth", AsyncMock(return_value=apply_result)):
+        with caplog.at_level(logging.ERROR, logger="terraformer.openbao_bootstrap"):
+            action = await ensure_platform_auth(settings, runner)
+
+    # The transport failure must not propagate — apply succeeded and the
+    # role re-verifies, so the overall converge still reports success.
+    assert action == "break_glass_applied"
+    assert revoke_route.call_count == 1
+    assert any(
+        "revoke-self" in r.message and "failed" in r.message for r in caplog.records
+    ), "expected a loud log line noting the revoke failure"
+    # And the token itself must never leak into that log line.
+    assert not any("root-token-xyz" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_revoke_non_success_status_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _fake_jwt(monkeypatch, tmp_path)
+    _fake_unseal_secret(monkeypatch)
+    settings = _settings()
+    runner = TerraformRunner(settings)
+
+    respx.post(_LOGIN_URL).mock(
+        side_effect=[httpx.Response(400, json={}), httpx.Response(200, json={})]
+    )
+    respx.post(_ATTEMPT_URL).mock(
+        return_value=httpx.Response(200, json={"nonce": "n-1", "otp": "otp-value"})
+    )
+    respx.post(_UPDATE_URL).mock(
+        return_value=httpx.Response(200, json={"complete": True, "encoded_token": "encoded-abc"})
+    )
+    respx.post(_DECODE_URL).mock(
+        return_value=httpx.Response(200, json={"data": {"token": "s.root-token-xyz"}})
+    )
+    revoke_route = respx.post(_REVOKE_URL).mock(return_value=httpx.Response(500, text="oops"))
+
+    apply_result = TerraformResult(exit_code=0, stdout="applied", stderr="", outputs={})
+    with patch.object(runner, "apply_platform_auth", AsyncMock(return_value=apply_result)):
+        with caplog.at_level(logging.ERROR, logger="terraformer.openbao_bootstrap"):
+            action = await ensure_platform_auth(settings, runner)
+
+    assert action == "break_glass_applied"
+    assert revoke_route.call_count == 1
+    assert any(
+        "revoke-self" in r.message and "500" in r.message for r in caplog.records
+    )

@@ -260,6 +260,26 @@ def test_workspace_dir_accepts_valid_tenant_id() -> None:
     assert str(path).startswith(str(settings.terraform_workdir_root.resolve()))
 
 
+@pytest.mark.asyncio
+async def test_platform_auth_workdir_blocks_symlink_escape() -> None:
+    """Unlike _workspace_dir, _platform_auth_workdir takes no caller
+    input — the `_platform_auth` subdirectory name is a fixed literal, so
+    the only realistic way it can ever resolve outside
+    terraform_workdir_root is a symlink planted at that path (e.g. a
+    misconfigured shared PV mount). The same defence-in-depth guard must
+    still catch that."""
+    settings = get_settings()
+    root = settings.terraform_workdir_root
+    root.mkdir(parents=True, exist_ok=True)
+    outside = root.parent / "outside-workdir-root"
+    outside.mkdir(parents=True, exist_ok=True)
+    (root / "_platform_auth").symlink_to(outside, target_is_directory=True)
+    runner = TerraformRunner(settings)
+
+    with pytest.raises(ValueError, match="platform-auth workdir escapes workdir root"):
+        runner._platform_auth_workdir()
+
+
 def test_scrub_credentials_redacts_known_secrets() -> None:
     """Every known credential value in stdout/stderr must be replaced
     with <REDACTED> before crossing the HTTP boundary."""
@@ -975,6 +995,46 @@ async def test_spawn_env_keeps_vault_addr_but_drops_vault_token(
 
     assert captured_env["VAULT_ADDR"] == "http://openbao.platform-tst.svc.cluster.local:8200"
     assert "VAULT_TOKEN" not in captured_env
+
+
+@pytest.mark.asyncio
+async def test_spawn_extra_env_merges_onto_subprocess_env(tmp_path: Path) -> None:
+    """`extra_env` (apply_platform_auth's one caller today, injecting a
+    transient break-glass VAULT_TOKEN) must actually land in the real
+    subprocess environment ON TOP OF everything _spawn already sets —
+    exercised against the real `_spawn`, not a mocked stand-in, so the
+    `env.update(extra_env)` merge itself is proven, not just that some
+    dict got threaded through call args."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/usr/bin/env",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    captured_env: dict[str, str] = {}
+    orig_create_subprocess_exec = __import__("asyncio").create_subprocess_exec
+
+    async def _capturing_exec(*args, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        return await orig_create_subprocess_exec(*args, **kwargs)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_capturing_exec):
+        await runner._spawn(
+            workdir,
+            ["--version"],
+            timeout=5,
+            extra_env={"VAULT_TOKEN": "s.break-glass-xyz"},
+        )
+
+    assert captured_env["VAULT_TOKEN"] == "s.break-glass-xyz"
+    # extra_env is additive, not a replacement — everything _spawn already
+    # sets must still be present alongside it.
+    assert captured_env["TF_CLI_CONFIG_FILE"] == settings.tf_cli_config_file
+    assert captured_env["AWS_ACCESS_KEY_ID"] == settings.tf_state_backend_access_key
 
 
 @pytest.mark.asyncio
@@ -2235,3 +2295,38 @@ async def test_apply_platform_auth_propagates_apply_failure(tmp_path: Path) -> N
             await runner.apply_platform_auth("s.root-token")
     assert exc_info.value.command == "apply"
     assert "permission denied" in exc_info.value.result.stderr
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_auth_propagates_init_failure(tmp_path: Path) -> None:
+    """`_init_platform_auth`'s own exit-code check — distinct from
+    `_ensure_platform_auth_workspace`'s missing-source-dir guard above —
+    must raise TerraformError("init", ...) and never reach the apply
+    step (no root token should ever be spent against a workspace that
+    didn't even init)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_platform_auth_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    init_fail = TerraformResult(
+        exit_code=1, stdout="", stderr="Error: failed to get existing workspaces: S3 bucket does not exist", outputs={},
+    )
+    spawn_calls: list[list[str]] = []
+
+    async def _fake_spawn(wd, args, timeout, extra_env=None):  # noqa: ARG001
+        spawn_calls.append(args)
+        return init_fail
+
+    with patch.object(runner, "_spawn", side_effect=_fake_spawn):
+        with pytest.raises(TerraformError) as exc_info:
+            await runner.apply_platform_auth("s.root-token")
+
+    assert exc_info.value.command == "init"
+    assert "S3 bucket does not exist" in exc_info.value.result.stderr
+    assert len(spawn_calls) == 1, "must not attempt apply after init fails"
