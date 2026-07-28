@@ -107,6 +107,67 @@ class Settings(BaseSettings):
         min_length=1,
         description="Mount path of the OpenBao Kubernetes auth backend.",
     )
+    terraformer_service_account_name: str = Field(
+        default="terraformer",
+        min_length=1,
+        description=(
+            "This pod's own ServiceAccount name — bound by "
+            "vault_kubernetes_auth_backend_role.terraformer (see "
+            "openbao_bootstrap.py) so the role only trusts this pod's "
+            "identity, never a literal in the applied module."
+        ),
+    )
+
+    # --- OpenBao self-bootstrap (services.terraformer.src.openbao_bootstrap)
+    #
+    # ensure_platform_auth() converges the kubernetes-auth role above at
+    # every boot instead of relying on a stored token (see the block
+    # comment above vault_k8s_auth_role for the incident this replaces).
+    # These fields are the Python-side surface it needs — distinct from
+    # VAULT_ADDR, which stays a bare env var read by the Terraform vault
+    # provider directly (see terraform_runner._provider_env's docstring on
+    # why that one is deliberately NOT threaded through Settings). This
+    # code, unlike the provider block, makes its own HTTP calls against
+    # OpenBao's API (kubernetes-auth login probe, break-glass
+    # generate-root) and against the Kubernetes API (reading the unseal
+    # Secret), so it needs a typed value to build those requests from —
+    # never a hardcoded literal.
+    vault_addr: str = Field(
+        ...,
+        description=(
+            "OpenBao/Vault base URL for the Python-side bootstrap HTTP "
+            "calls in openbao_bootstrap.py (kubernetes-auth login probe, "
+            "break-glass generate-root, revoke-self). The Terraform vault "
+            "provider reads its own VAULT_ADDR directly from the "
+            "subprocess environment (ambient, not this field) — see "
+            "terraform_runner._provider_env."
+        ),
+    )
+    openbao_namespace: str = Field(
+        default="openbao",
+        min_length=1,
+        description="Namespace holding the OpenBao StatefulSet and its openbao_bootstrap_secret_name Secret.",
+    )
+    openbao_bootstrap_secret_name: str = Field(
+        default="openbao-bootstrap",
+        min_length=1,
+        description=(
+            "k8s Secret (in openbao_namespace) holding the Shamir unseal "
+            "shares as keys UNSEAL_KEY_1..openbao_unseal_key_count — read "
+            "only on the break-glass path, never cached, never logged."
+        ),
+    )
+    openbao_unseal_key_count: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Number of UNSEAL_KEY_N entries in openbao_bootstrap_secret_name "
+            "AND the Shamir threshold to submit to /sys/generate-root/update "
+            "— a typed bound instead of a hardcoded 'range(1, 4)' so a "
+            "cluster reconfigured to a different threshold needs a config "
+            "change, not a code change."
+        ),
+    )
 
     apply_timeout_seconds: int = 600
     destroy_timeout_seconds: int = 600

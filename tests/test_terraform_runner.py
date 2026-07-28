@@ -2058,3 +2058,180 @@ async def test_spawn_log_emitted_after_acquisition_not_before(
 
     spawn_lines_final = [r for r in caplog.records if r.getMessage().startswith("tf spawn: ")]
     assert len(spawn_lines_final) == 2
+
+
+# ---------------------------------------------------------------------------
+# Platform-auth bootstrap (feat/openbao-k8s-auth) — apply_platform_auth is
+# the break-glass apply target for openbao_bootstrap.ensure_platform_auth.
+# Uses a transient root token via _spawn's extra_env, never the generated
+# k8s-auth provider_vault.tf (that role doesn't exist yet on the only
+# occasion this harness runs).
+# ---------------------------------------------------------------------------
+
+
+def _seed_platform_auth_standalone(standalone_root: Path) -> None:
+    src = standalone_root / "platform-auth-bootstrap"
+    src.mkdir(parents=True)
+    (src / "main.tf").write_text('terraform {\n  required_version = ">= 1.6"\n}\n')
+
+
+@pytest.mark.asyncio
+async def test_ensure_platform_auth_workspace_has_backend_stub_and_no_vault_provider_file(
+    tmp_path: Path,
+) -> None:
+    """This harness must get a backend.tf stub (same reusable-root
+    convention as _ensure_workspace) but NEVER the generated
+    provider_vault.tf: that file authenticates via auth_login_kubernetes
+    against the very role this harness's job is to create — circular on
+    the only occasion this harness ever runs (a cold start)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_platform_auth_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    workdir = await runner._ensure_platform_auth_workspace()
+
+    assert (workdir / "main.tf").exists()
+    backend_tf = workdir / "backend.tf"
+    assert backend_tf.exists()
+    assert 'backend "s3"' in backend_tf.read_text()
+    assert not (workdir / "provider_vault.tf").exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_platform_auth_workspace_missing_source_raises(tmp_path: Path) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    with pytest.raises(TerraformError) as exc_info:
+        await runner._ensure_platform_auth_workspace()
+    assert exc_info.value.command == "init"
+    assert "platform-auth-bootstrap" in exc_info.value.result.stderr
+
+
+def test_platform_auth_backend_config_state_key_disjoint_from_every_other_workspace() -> None:
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    key = runner._platform_auth_backend_config()["key"]
+    assert key == f"platform/auth-bootstrap/{settings.env}.tfstate"
+    assert key != runner._platform_secrets_backend_config(settings.env)["key"]
+    assert key != runner._platform_bus_topology_backend_config(settings.env)["key"]
+    assert not key.startswith("tenants/")
+
+
+def test_platform_auth_tfvars_carries_role_mount_namespace_and_sa_name() -> None:
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    vars_ = runner._platform_auth_tfvars()
+    assert vars_ == {
+        "pooled_namespace": settings.pneuma_namespace,
+        "vault_k8s_auth_mount": settings.vault_k8s_auth_mount,
+        "vault_k8s_auth_role": settings.vault_k8s_auth_role,
+        "terraformer_service_account_name": settings.terraformer_service_account_name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_auth_injects_vault_token_for_apply_only(
+    tmp_path: Path,
+) -> None:
+    """The break-glass root token must reach ONLY the apply subprocess's
+    env (via _spawn's extra_env) — never the init call, and never folded
+    into _provider_env() where every other invocation would pick it up."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_platform_auth_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    captured_extra_env: list[dict[str, str] | None] = []
+    ok = TerraformResult(exit_code=0, stdout="applied", stderr="", outputs={})
+
+    async def _fake_spawn(wd, args, timeout, extra_env=None):  # noqa: ARG001
+        captured_extra_env.append(extra_env)
+        return ok
+
+    with patch.object(runner, "_spawn", AsyncMock(side_effect=_fake_spawn)):
+        result = await runner.apply_platform_auth("s.break-glass-root-token")
+
+    assert result.exit_code == 0
+    assert len(captured_extra_env) == 2, "expected init then apply"
+    init_env, apply_env = captured_extra_env
+    assert init_env is None
+    assert apply_env == {"VAULT_TOKEN": "s.break-glass-root-token"}
+    assert "VAULT_TOKEN" not in runner._provider_env()
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_auth_wipes_tfvars_on_success_and_failure(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_platform_auth_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+    tfvars_path = settings.terraform_workdir_root / "_platform_auth" / "terraform.tfvars.json"
+
+    ok = TerraformResult(exit_code=0, stdout="applied", stderr="", outputs={})
+    with patch.object(runner, "_spawn", AsyncMock(return_value=ok)):
+        await runner.apply_platform_auth("s.root-token")
+    assert not tfvars_path.exists()
+
+    apply_fail = TerraformResult(exit_code=1, stdout="", stderr="denied", outputs={})
+    spawn_results = [ok, apply_fail]  # init ok, apply fails
+
+    async def _fake_spawn(*args, **kwargs):
+        return spawn_results.pop(0)
+
+    with patch.object(runner, "_spawn", side_effect=_fake_spawn):
+        with pytest.raises(TerraformError):
+            await runner.apply_platform_auth("s.root-token")
+    assert not tfvars_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_platform_auth_propagates_apply_failure(tmp_path: Path) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_platform_auth_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    init_ok = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+    apply_fail = TerraformResult(exit_code=1, stdout="", stderr="permission denied", outputs={})
+    spawn_results = [init_ok, apply_fail]
+
+    async def _fake_spawn(*args, **kwargs):
+        return spawn_results.pop(0)
+
+    with patch.object(runner, "_spawn", side_effect=_fake_spawn):
+        with pytest.raises(TerraformError) as exc_info:
+            await runner.apply_platform_auth("s.root-token")
+    assert exc_info.value.command == "apply"
+    assert "permission denied" in exc_info.value.result.stderr

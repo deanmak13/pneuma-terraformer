@@ -24,6 +24,7 @@ _REQUIRED_ENV = {
     "POSTGRES_SUPERUSER_PASSWORD": "pg-pass-1234",
     "RABBITMQ_ADMIN_PASSWORD": "rmq-pass-1234",
     "MINIO_ADMIN_PASSWORD": "minio-pass-1234",
+    "VAULT_ADDR": "http://openbao.openbao.svc.cluster.local:8200",
 }
 
 

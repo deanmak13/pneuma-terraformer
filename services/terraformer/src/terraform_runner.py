@@ -296,6 +296,7 @@ class TerraformRunner:
         workdir: Path,
         args: list[str],
         timeout: int,
+        extra_env: dict[str, str] | None = None,
     ) -> TerraformResult:
         cmd = [self._settings.terraform_binary, *args]
         # Redact any -backend-config=key=value pairs that carry secrets
@@ -340,6 +341,12 @@ class TerraformRunner:
         # — env-only, never argv, so they never appear in a process
         # listing or the redacted argv log line above.
         env.update(self._provider_env())
+        # Per-call overrides — used exactly once today: apply_platform_auth
+        # injects a transient break-glass VAULT_TOKEN for its own single
+        # apply, without ever folding that token into _provider_env()
+        # (which every other terraform invocation on this runner shares).
+        if extra_env:
+            env.update(extra_env)
 
         # Bound concurrent subprocesses (see _spawn_semaphore) — held across
         # the FULL subprocess lifetime, including the timeout/kill branch
@@ -1018,6 +1025,155 @@ class TerraformRunner:
                     stderr=result.stderr,
                     outputs=outputs,
                 )
+            finally:
+                self._wipe_tfvars(workdir)
+
+
+    # --- Platform-auth bootstrap (services.terraformer.src.openbao_bootstrap) ---
+    #
+    # Break-glass apply target for ensure_platform_auth's cold-start path.
+    # Creates vault_policy.terraformer + vault_kubernetes_auth_backend_role.
+    # terraformer — the two resources modules/bootstrap/terraformer_auth.tf
+    # (pneuma-deployments@290c443) added to the ONE-SHOT cluster-bootstrap
+    # module. That module needs full cluster-admin kubeconfig and a dozen
+    # unrelated inputs (Cloudflare, ArgoCD, Kyverno, ...), so it cannot be
+    # what a running pod re-applies at every boot. This harness instead
+    # extracts just those two resources into their own standalone root —
+    # `platform-auth-bootstrap`, baked from pneuma-deployments'
+    # infrastructure/terraform/standalone/platform-auth-bootstrap/ via the
+    # SAME Dockerfile mechanism that already bakes platform-secrets-apply /
+    # platform-bus-topology-apply (DEPLOYMENTS_REF build-arg — see
+    # settings.terraform_standalone_root). It references the existing
+    # "kubernetes" auth-backend MOUNT by path (var.vault_k8s_auth_mount)
+    # rather than managing a vault_auth_backend resource itself: that mount
+    # already exists live (created once by modules/bootstrap/
+    # external_secrets.tf's vault_auth_backend.kubernetes, which ESO's role
+    # already authenticates against), and a standalone harness with its own
+    # Terraform state cannot reference a resource owned by a different
+    # state.
+    _PLATFORM_AUTH_HARNESS = "platform-auth-bootstrap"
+
+    def _platform_auth_workdir(self) -> Path:
+        """Single per-pod workspace. Unlike _platform_secrets_workdir /
+        _platform_bus_topology_workdir (which serve a cycle-dispatched
+        capability that names an `env` per-request), this bootstraps THIS
+        pod's own OpenBao identity in THIS pod's own cluster (settings.env)
+        — there is no caller-supplied env axis to parameterize."""
+        root = self._settings.terraform_workdir_root.resolve()
+        candidate = (root / "_platform_auth").resolve()
+        if not str(candidate).startswith(str(root) + "/"):
+            raise ValueError("platform-auth workdir escapes workdir root")
+        return candidate
+
+    def _platform_auth_source(self) -> Path:
+        return self._settings.terraform_standalone_root / self._PLATFORM_AUTH_HARNESS
+
+    def _platform_auth_backend_config(self) -> dict[str, str]:
+        # Same flat-primitives-only shape as every other backend-config
+        # dict on this runner (see _backend_config's comment for why
+        # nested `endpoints` cannot travel via CLI -backend-config). Key
+        # is `platform/auth-bootstrap/<env>.tfstate` — disjoint from every
+        # other state key this runner uses.
+        s = self._settings
+        return {
+            "bucket": s.tf_state_backend_bucket,
+            "key": f"platform/auth-bootstrap/{s.env}.tfstate",
+            "region": s.tf_state_backend_region,
+            "use_path_style": "true",
+            "skip_credentials_validation": "true",
+            "skip_region_validation": "true",
+            "skip_metadata_api_check": "true",
+            "skip_requesting_account_id": "true",
+        }
+
+    def _platform_auth_tfvars(self) -> dict[str, str]:
+        s = self._settings
+        return {
+            "pooled_namespace": s.pneuma_namespace,
+            "vault_k8s_auth_mount": s.vault_k8s_auth_mount,
+            "vault_k8s_auth_role": s.vault_k8s_auth_role,
+            "terraformer_service_account_name": s.terraformer_service_account_name,
+        }
+
+    async def _ensure_platform_auth_workspace(self) -> Path:
+        workdir = self._platform_auth_workdir()
+        workdir.mkdir(parents=True, exist_ok=True)
+        source = self._platform_auth_source()
+        if not source.exists():
+            raise TerraformError(
+                "init",
+                TerraformResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"platform-auth-bootstrap harness not found at {source}",
+                    outputs={},
+                ),
+            )
+        for f in source.iterdir():
+            if f.is_file():
+                shutil.copy2(f, workdir / f.name)
+        # The harness ships with no backend block (same reusable-root
+        # convention as the tenant module's versions.tf) — stub one so
+        # -backend-config args have something to bind to.
+        (workdir / "backend.tf").write_text('terraform {\n  backend "s3" {}\n}\n')
+        # Deliberately NO _write_vault_provider_file() here: that generated
+        # block authenticates via auth_login_kubernetes against the very
+        # role this harness's job is to create — using it here would be
+        # circular (the role never exists yet on the only occasion this
+        # harness runs: a cold start). This harness's own main.tf instead
+        # declares a bare `provider "vault" {}` that reads VAULT_ADDR
+        # (ambient — see _spawn) and VAULT_TOKEN (the transient break-glass
+        # root token, injected only for this one apply via _spawn's
+        # extra_env — see apply_platform_auth) straight from the
+        # subprocess environment.
+        return workdir
+
+    async def _init_platform_auth(self, workdir: Path) -> None:
+        backend_args: list[str] = []
+        for k, v in self._platform_auth_backend_config().items():
+            backend_args.extend(["-backend-config", f"{k}={v}"])
+        result = await self._spawn(
+            workdir,
+            ["init", "-input=false", "-no-color", *backend_args],
+            timeout=120,
+        )
+        if result.exit_code != 0:
+            raise TerraformError("init", result)
+
+    async def _platform_auth_tfvars_file(self, workdir: Path) -> Path:
+        path = workdir / "terraform.tfvars.json"
+        path.write_text(json.dumps(self._platform_auth_tfvars()))
+        return path
+
+    async def apply_platform_auth(self, root_token: str, timeout: int = 120) -> TerraformResult:
+        """Break-glass entrypoint — one step of the converge flow in
+        services.terraformer.src.openbao_bootstrap.ensure_platform_auth.
+
+        Applies the platform-auth-bootstrap harness using a transient root
+        token the CALLER already minted via OpenBao's generate-root flow —
+        never the (not-yet-existing) k8s-auth role this very apply
+        creates. The token travels via VAULT_TOKEN on THIS ONE
+        subprocess's env only (see _spawn's extra_env): never written to a
+        var file, never logged, never folded into _provider_env() (which
+        every other terraform invocation on this runner shares and which
+        deliberately carries no VAULT_TOKEN — see _provider_env's
+        docstring on why a stored token is the failure class this whole
+        feature removes).
+        """
+        async with self._lock_for("_platform_auth"):
+            workdir = await self._ensure_platform_auth_workspace()
+            await self._init_platform_auth(workdir)
+            await self._platform_auth_tfvars_file(workdir)
+            try:
+                result = await self._spawn(
+                    workdir,
+                    ["apply", "-auto-approve", "-no-color"],
+                    timeout=timeout,
+                    extra_env={"VAULT_TOKEN": root_token},
+                )
+                if result.exit_code != 0:
+                    raise TerraformError("apply", result)
+                return result
             finally:
                 self._wipe_tfvars(workdir)
 

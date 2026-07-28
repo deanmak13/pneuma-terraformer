@@ -20,6 +20,8 @@ from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field
 
 from services.terraformer.src.auth import require_admin_key
+from services.terraformer.src.openbao_bootstrap import ensure_platform_auth
+from services.terraformer.src.settings import get_settings
 from services.terraformer.src.terraform_runner import (
     PlatformSecretsInputs,
     TenantInputs,
@@ -202,4 +204,46 @@ async def reconcile_platform_secrets(req: PlatformSecretsRequest) -> PlatformSec
         outputs=result.outputs,
         stdout_tail=_tail(result.stdout),
         stderr_tail=_tail(result.stderr),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin: on-demand OpenBao auth bootstrap
+#
+# Exposes the exact same convergence services.terraformer.src.main runs
+# automatically at every boot (see _ensure_openbao_auth there) — one source
+# of truth, callable on demand for operator-triggered re-checks without a
+# pod restart. Mounted on this router (final path
+# /provisioning/admin/bootstrap/openbao-auth) so it shares the X-Admin-Key
+# gate + error-shape conventions every other route here uses.
+# ---------------------------------------------------------------------------
+
+
+class OpenBaoAuthBootstrapResult(BaseModel):
+    role: str
+    mount: str
+    action: str
+
+
+@router.post("/admin/bootstrap/openbao-auth", response_model=OpenBaoAuthBootstrapResult)
+async def bootstrap_openbao_auth() -> OpenBaoAuthBootstrapResult:
+    settings = get_settings()
+    runner = get_runner()
+    try:
+        action = await ensure_platform_auth(settings, runner)
+    except TerraformError as exc:
+        _LOG.error("openbao auth bootstrap failed at phase=%s: %s", exc.command, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"phase": exc.command, "stderr_tail": _tail(exc.result.stderr)},
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — surfaced verbatim; these carry no secrets
+        _LOG.error("openbao auth bootstrap failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+    return OpenBaoAuthBootstrapResult(
+        role=settings.vault_k8s_auth_role,
+        mount=settings.vault_k8s_auth_mount,
+        action=action,
     )

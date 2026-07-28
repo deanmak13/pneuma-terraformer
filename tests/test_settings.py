@@ -169,3 +169,75 @@ def test_vault_k8s_auth_role_and_mount_reject_empty(
     monkeypatch.setenv(env_var, "")
     with pytest.raises(ValidationError):
         Settings()
+
+
+# ---------------------------------------------------------------------------
+# OpenBao self-bootstrap settings (openbao_bootstrap.ensure_platform_auth) —
+# fixes the boot deadlock: OPENBAO_ADMIN_TOKEN required-but-unfulfillable.
+# ---------------------------------------------------------------------------
+
+
+def test_openbao_admin_token_never_required_to_boot() -> None:
+    """The service must start with only VAULT_ADDR + its own SA token +
+    k8s API access — no OPENBAO_ADMIN_TOKEN env var at all."""
+    import os
+
+    from services.terraformer.src.settings import Settings
+
+    assert "OPENBAO_ADMIN_TOKEN" not in os.environ
+    s = Settings()
+    assert not hasattr(s, "openbao_admin_token")
+
+
+def test_vault_addr_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import ValidationError
+
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.delenv("VAULT_ADDR", raising=False)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_vault_addr_accepts_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv("VAULT_ADDR", "http://openbao.openbao.svc.cluster.local:8200")
+    s = Settings()
+    assert s.vault_addr == "http://openbao.openbao.svc.cluster.local:8200"
+
+
+def test_openbao_bootstrap_defaults() -> None:
+    from services.terraformer.src.settings import Settings
+
+    s = Settings()
+    assert s.openbao_namespace == "openbao"
+    assert s.openbao_bootstrap_secret_name == "openbao-bootstrap"
+    assert s.openbao_unseal_key_count == 3
+    assert s.terraformer_service_account_name == "terraformer"
+
+
+def test_openbao_bootstrap_settings_accept_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv("OPENBAO_NAMESPACE", "openbao-secondary")
+    monkeypatch.setenv("OPENBAO_BOOTSTRAP_SECRET_NAME", "bao-unseal")
+    monkeypatch.setenv("OPENBAO_UNSEAL_KEY_COUNT", "5")
+    monkeypatch.setenv("TERRAFORMER_SERVICE_ACCOUNT_NAME", "terraformer-prod")
+    s = Settings()
+    assert s.openbao_namespace == "openbao-secondary"
+    assert s.openbao_bootstrap_secret_name == "bao-unseal"
+    assert s.openbao_unseal_key_count == 5
+    assert s.terraformer_service_account_name == "terraformer-prod"
+
+
+def test_openbao_unseal_key_count_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import ValidationError
+
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv("OPENBAO_UNSEAL_KEY_COUNT", "0")
+    with pytest.raises(ValidationError):
+        Settings()
