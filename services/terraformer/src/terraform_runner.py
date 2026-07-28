@@ -55,6 +55,93 @@ _TENANT_MODULE = "tenant"
 # timeout, so it only trips when there is truly no meaningful time left.
 _MIN_RUN_SECONDS_AFTER_QUEUE = 1
 
+# ---------------------------------------------------------------------------
+# Transient infrastructure-provider conflict registry — LAW: design for N,
+# never for 1 (~/.claude/docs/design-for-n-not-1.md). `max_concurrent_
+# terraform_runs` stays > 1 on purpose (tenant signup concurrency is a
+# scaling requirement, not a bug to fix by serializing), which means two
+# concurrent `terraform apply` runs legitimately contend on infrastructure
+# that is SHARED across tenants even though each tenant owns distinct
+# rows/schemas. Postgres's catalog tables (pg_authid, pg_shdepend, ...) are
+# the first instance of this, live 2026-07-29 against tenant b6c10c08:
+#
+#   Error: could not execute revoke query: pq: tuple concurrently updated (XX000)
+#     with postgresql_grant.tenant_admin_schema_all,
+#     on postgres.tf line 49, in resource "postgresql_grant" "tenant_admin_schema_all"
+#
+# Each row below names ONE provider's transient-conflict fingerprint by its
+# SQLSTATE (or vendor equivalent) plus the condition's human name, matched
+# case-insensitively against a failed run's combined stdout+stderr. A 4th
+# signature — another Postgres SQLSTATE, or a RabbitMQ/MinIO/OpenBao
+# equivalent raised by a different provider block — is a NEW ROW here,
+# never an `if "..." in err:` branch at the `_spawn` call site: `_spawn`
+# treats every row identically.
+@dataclass(frozen=True)
+class _TransientConflictSignature:
+    name: str
+    # Case-insensitive substrings; ANY match is a hit. Each row carries
+    # both the raw SQLSTATE/vendor code and the condition's human name so
+    # a driver/provider that surfaces only one of the two (bare message
+    # text vs. a code appended in parens, as in the live example above) is
+    # still recognised.
+    patterns: tuple[str, ...]
+
+
+_TRANSIENT_CONFLICT_SIGNATURES: tuple[_TransientConflictSignature, ...] = (
+    # Postgres SQLSTATE XX000 (internal_error) — this specific message is
+    # MVCC contention on the *shared* catalogs (pg_authid/pg_shdepend) that
+    # every CREATE ROLE / GRANT / REVOKE touches, even though each
+    # tenant's own role and schema are distinct. This is the live
+    # 2026-07-29 error quoted above.
+    _TransientConflictSignature(
+        name="postgres_tuple_concurrently_updated",
+        patterns=("XX000", "tuple concurrently updated"),
+    ),
+    # Postgres SQLSTATE 40001 (serialization_failure) — a concurrent
+    # transaction's write won the race under REPEATABLE READ/SERIALIZABLE;
+    # Postgres's own documented recovery is to retry the transaction.
+    _TransientConflictSignature(
+        name="postgres_serialization_failure",
+        patterns=("40001", "serialization_failure"),
+    ),
+    # Postgres SQLSTATE 40P01 (deadlock_detected) — two transactions (e.g.
+    # two tenants' concurrent GRANT/REVOKE lock ordering) waited on each
+    # other; Postgres kills one, safe to retry the whole apply.
+    _TransientConflictSignature(
+        name="postgres_deadlock_detected",
+        patterns=("40P01", "deadlock_detected"),
+    ),
+)
+
+
+def _match_transient_conflict(stdout: str, stderr: str) -> _TransientConflictSignature | None:
+    """Return the first registry row whose pattern appears (case-
+    insensitively) in the combined stdout+stderr of a failed run, or None
+    if nothing matches. None is what tells `_spawn` a failure is NOT safe
+    to blindly retry — a genuine HCL/schema error, a bad credential, a
+    real provider rejection, etc. must never be retried."""
+    combined = f"{stdout}\n{stderr}".lower()
+    for signature in _TRANSIENT_CONFLICT_SIGNATURES:
+        if any(pattern.lower() in combined for pattern in signature.patterns):
+            return signature
+    return None
+
+
+# Bounded attempts for a `_spawn` dispatch that keeps failing with a
+# matched transient-conflict signature — small and fixed, not a Settings
+# field: terraform apply/init/destroy are idempotent so re-running is
+# safe, but nothing about a deployment's environment should change how
+# many times we blindly retry the SAME queued request before surfacing
+# the failure.
+_MAX_TRANSIENT_CONFLICT_ATTEMPTS = 3
+
+# Backoff before each transient-conflict retry, doubling per retry (1s
+# then 2s, for the 3-attempt cap above) — these are catalog-level lock-
+# contention windows measured in milliseconds to low seconds, not a
+# rate-limited external API, so a longer backoff would only eat further
+# into the caller's already-shared timeout budget for no benefit.
+_TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS = 1.0
+
 # Kubernetes ServiceAccount projection paths — module-level constants
 # (not Settings fields) so tests can monkeypatch them directly onto this
 # module without threading a new Settings field through every call site.
@@ -194,17 +281,20 @@ class TerraformRunner:
             self._sem = asyncio.Semaphore(self._settings.max_concurrent_terraform_runs)
         return self._sem
 
-    def _spawn_queue_budget(self, timeout: int) -> int:
+    def _spawn_queue_budget(self, timeout: float) -> int:
         """Seconds a given `_spawn` call may wait to ACQUIRE a concurrency
         slot before giving up with exit_code=124 — a fraction of that
         call's OWN `timeout`, never a flat constant (see settings.py's
         `spawn_queue_timeout_fraction` docstring for why a flat value
         can't simultaneously suit a 30s read and a 600s apply). Floored
         at 1s so a very short-timeout op still gets one real queue
-        attempt instead of a 0s budget that fails before ever trying."""
+        attempt instead of a 0s budget that fails before ever trying.
+        `timeout` is a float (not just int) because a transient-conflict
+        retry (see `_spawn`) passes the BUDGET REMAINING after prior
+        attempts, which is a subtraction of monotonic-clock reads."""
         return max(1, int(timeout * self._settings.spawn_queue_timeout_fraction))
 
-    def _effective_run_timeout(self, timeout: int, queued_elapsed: float) -> float:
+    def _effective_run_timeout(self, timeout: float, queued_elapsed: float) -> float:
         """Run-time budget remaining AFTER the queue wait is deducted from
         the operation's own `timeout` — NOT the full `timeout` again.
 
@@ -295,7 +385,79 @@ class TerraformRunner:
         self,
         workdir: Path,
         args: list[str],
-        timeout: int,
+        timeout: float,
+        extra_env: dict[str, str] | None = None,
+    ) -> TerraformResult:
+        """Bounded-attempt wrapper around `_spawn_once` (below): retries a
+        run that BOTH failed AND whose combined stdout+stderr matched a
+        registered transient-conflict signature (see
+        _TRANSIENT_CONFLICT_SIGNATURES) — e.g. two concurrent tenant
+        applies' `CREATE ROLE` / `GRANT` contending on Postgres's shared
+        catalogs (pg_authid/pg_shdepend), live 2026-07-29 against tenant
+        b6c10c08. `terraform apply`/`init`/`destroy` are idempotent, so
+        re-running is safe. A clean success, or a clean failure with no
+        signature match (a genuine HCL/schema error, a bad credential, a
+        real provider rejection, ...), returns on the FIRST attempt —
+        only a matched, retryable failure ever loops.
+
+        Stays INSIDE the caller's own `timeout` budget by construction:
+        `timeout` here is the same "whole RPC" budget `_spawn_once`
+        already treats as queue-wait + run (see _effective_run_timeout /
+        _spawn_queue_budget). Each retry hands `_spawn_once` what's LEFT
+        of that budget — elapsed time since entering `_spawn`, backoff
+        sleeps included, subtracted from `timeout` — never the full
+        `timeout` again. If the remaining budget can't fit the mandatory
+        backoff PLUS `_spawn_once`'s own refuse-to-start floor
+        (_MIN_RUN_SECONDS_AFTER_QUEUE), retrying stops and the original
+        failure is returned: starting one more attempt with no real time
+        left would just repeat the exact "partial work then killed mid-
+        run" failure mode `_spawn_once` already guards against.
+        """
+        overall_start = time.monotonic()
+        attempt = 1
+        # The FIRST attempt always gets the caller's raw `timeout`
+        # unchanged — never `timeout` minus this wrapper's own
+        # negligible bookkeeping overhead — so the common, no-retry-
+        # needed case hands `_spawn_once` bit-for-bit the same budget as
+        # calling it directly. Only a RETRY needs its budget shrunk by
+        # what earlier attempts (and their backoff) actually spent.
+        timeout_for_attempt = timeout
+        while True:
+            result = await self._spawn_once(workdir, args, timeout_for_attempt, extra_env)
+            if result.exit_code == 0:
+                return result
+            signature = _match_transient_conflict(result.stdout, result.stderr)
+            if signature is None or attempt >= _MAX_TRANSIENT_CONFLICT_ATTEMPTS:
+                return result
+
+            backoff = _TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            remaining = timeout - (time.monotonic() - overall_start)
+            if remaining <= backoff + _MIN_RUN_SECONDS_AFTER_QUEUE:
+                _LOG.warning(
+                    "tf spawn NOT retrying transient conflict signature=%s "
+                    "(attempt %d/%d): only %.1fs of the %.1fs budget remains, "
+                    "below backoff+floor (%.1fs+%ds): workdir=%s cmd=%s",
+                    signature.name, attempt, _MAX_TRANSIENT_CONFLICT_ATTEMPTS,
+                    remaining, timeout, backoff, _MIN_RUN_SECONDS_AFTER_QUEUE,
+                    workdir, args[0] if args else "<no-args>",
+                )
+                return result
+
+            attempt += 1
+            _LOG.info(
+                "tf spawn retrying after transient conflict: signature=%s "
+                "attempt=%d/%d workdir=%s cmd=%s",
+                signature.name, attempt, _MAX_TRANSIENT_CONFLICT_ATTEMPTS,
+                workdir, args[0] if args else "<no-args>",
+            )
+            await asyncio.sleep(backoff)
+            timeout_for_attempt = timeout - (time.monotonic() - overall_start)
+
+    async def _spawn_once(
+        self,
+        workdir: Path,
+        args: list[str],
+        timeout: float,
         extra_env: dict[str, str] | None = None,
     ) -> TerraformResult:
         cmd = [self._settings.terraform_binary, *args]
