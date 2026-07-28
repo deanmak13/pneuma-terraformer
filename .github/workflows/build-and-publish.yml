@@ -44,7 +44,18 @@ env:
   # never reached the runner, because this pin still referenced the
   # pre-fix commit. Live evidence: tenant 8b11192c failed `terraform apply`
   # 2s after spawn on exactly that line.
-  DEPLOYMENTS_REF: 7260e1f9d573fb60c453efefbf779176573aaf19
+  # Bumped 2026-07-28 to bake standalone/platform-auth-bootstrap/, which the
+  # startup self-bootstrap applies. Without it the pod boots, breaks glass
+  # successfully, and then dies on:
+  #   TerraformError: platform-auth-bootstrap harness not found at
+  #   /app/infrastructure/terraform/standalone/platform-auth-bootstrap
+  #
+  # THIRD stale-pin incident today (null-profile validation, the Argo chart
+  # pin, and now this). The recurring shape: a fix merges to pneuma-deployments
+  # and the consuming pin never moves, so the merge looks successful and the
+  # running system is unchanged. Anything added under infrastructure/terraform/
+  # that this image must execute requires bumping this ref in the same wave.
+  DEPLOYMENTS_REF: 30fd31d8834214cf7c44a853efc0d3d70381c2f0
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
