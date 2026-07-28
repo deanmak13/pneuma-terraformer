@@ -661,6 +661,41 @@ async def test_vault_provider_role_and_mount_come_from_settings_not_literals(
     assert "a-second-cluster-role" not in hcl_a
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("kubernetes", "kubernetes"), ("/kubernetes/", "kubernetes"), (" k8s ", "k8s")],
+)
+def test_auth_mount_is_slash_normalised(tmp_path: Path, raw: str, expected: str) -> None:
+    """The mount is interpolated into `auth/<mount>/login`, so stray slashes
+    would yield a malformed endpoint. Normalisation happens in Settings so
+    the generator never has to re-derive it."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        vault_k8s_auth_mount=raw,
+    )
+    assert settings.vault_k8s_auth_mount == expected
+    _seed_module(settings.terraform_modules_root)
+    assert (
+        f'path = "auth/{expected}/login"'
+        in TerraformRunner(settings)._vault_provider_hcl()
+    )
+
+
+@pytest.mark.parametrize("raw", ["/", "//", "   "])
+def test_auth_mount_rejects_slash_only_values(tmp_path: Path, raw: str) -> None:
+    """`min_length=1` passes "/" — it strips to empty and would render
+    `auth//login`. Reject at config load instead of shipping a broken path."""
+    with pytest.raises(ValueError, match="must name a mount path"):
+        Settings(
+            terraform_workdir_root=tmp_path / "wd",
+            terraform_modules_root=tmp_path / "modules",
+            terraform_binary="/bin/true",
+            vault_k8s_auth_mount=raw,
+        )
+
+
 @pytest.mark.asyncio
 async def test_ensure_platform_secrets_workspace_writes_vault_provider_file(
     tmp_path: Path,

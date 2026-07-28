@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -107,6 +107,25 @@ class Settings(BaseSettings):
         min_length=1,
         description="Mount path of the OpenBao Kubernetes auth backend.",
     )
+
+    @field_validator("vault_k8s_auth_mount")
+    @classmethod
+    def _normalise_auth_mount(cls, v: str) -> str:
+        """Normalise the mount to a bare path segment.
+
+        The mount is interpolated into the generated provider's login path
+        (``auth/<mount>/login``), so surrounding slashes would silently
+        produce a malformed endpoint like ``auth//login``. ``min_length=1``
+        alone does not catch that — ``"/"`` passes it and strips to empty.
+        Normalise once, here, so the generator interpolates a value that is
+        already known-good rather than re-deriving it.
+        """
+        mount = v.strip().strip("/")
+        if not mount:
+            raise ValueError(
+                "vault_k8s_auth_mount must name a mount path, not just slashes"
+            )
+        return mount
     terraformer_service_account_name: str = Field(
         default="terraformer",
         min_length=1,
