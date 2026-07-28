@@ -2053,19 +2053,24 @@ async def test_spawn_run_timeout_is_reduced_by_actual_queue_wait(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
 
     # Fake time.monotonic() to simulate a 40s queue wait for a 600s-timeout
-    # call without a real sleep: the FIRST call (_spawn's `_t0` read)
-    # returns 0.0, every call after that returns 40.0. Clamping (rather
-    # than a finite iterator falling back to the real clock) matters
-    # because asyncio.wait_for's own deadline bookkeeping calls
-    # loop.time() -> time.monotonic() too, at least once, between our
-    # `_t0` read and our `_queued_s` read — a strict 2-value iterator
-    # would be consumed by that hidden call and hand our own
-    # `_queued_s` read a huge real-clock fallback value instead of 40.0.
+    # call without a real sleep: the FIRST TWO calls return 0.0, every call
+    # after that returns 40.0. Two (not one) because `_spawn` (the bounded-
+    # retry wrapper — see fix/transient-conflict-retry) reads its own
+    # `overall_start` before ever delegating to `_spawn_once`, whose `_t0`
+    # read is now the SECOND call, not the first; both are effectively
+    # simultaneous (negligible real overhead between them) so clamping both
+    # to 0.0 is faithful, not a loosened assertion. Clamping (rather than a
+    # finite iterator falling back to the real clock) matters because
+    # asyncio.wait_for's own deadline bookkeeping calls loop.time() ->
+    # time.monotonic() too, at least once, between our `_t0` read and our
+    # `_queued_s` read — a strict iterator would be consumed by that hidden
+    # call and hand our own `_queued_s` read a huge real-clock fallback
+    # value instead of 40.0.
     _calls = {"n": 0}
 
     def _fake_monotonic() -> float:
         _calls["n"] += 1
-        return 0.0 if _calls["n"] == 1 else 40.0
+        return 0.0 if _calls["n"] <= 2 else 40.0
 
     monkeypatch.setattr(runner_mod.time, "monotonic", _fake_monotonic)
 
@@ -2119,15 +2124,19 @@ async def test_spawn_refuses_to_start_when_queue_wait_consumes_budget(
 
     # timeout=30, simulate a 29.5s queue wait -> remaining=0.5s, below the
     # 1s floor -> must refuse without ever reaching create_subprocess_exec.
-    # Clamp (rather than a finite iterator) past the first call: asyncio's
-    # own wait_for deadline bookkeeping also calls time.monotonic() at
-    # least once between our `_t0` and `_queued_s` reads, and a strict
-    # 2-value iterator would hand that hidden call the real clock instead.
+    # First TWO calls return 0.0 (not one): `_spawn`'s own `overall_start`
+    # read now precedes `_spawn_once`'s `_t0` read (bounded-retry wrapper —
+    # see fix/transient-conflict-retry); both are effectively simultaneous,
+    # so clamping both to 0.0 is faithful. Clamp past those two (rather
+    # than a finite iterator) because asyncio's own wait_for deadline
+    # bookkeeping also calls time.monotonic() at least once between our
+    # `_t0` and `_queued_s` reads, and a strict iterator would hand that
+    # hidden call the real clock instead.
     _calls = {"n": 0}
 
     def _fake_monotonic() -> float:
         _calls["n"] += 1
-        return 0.0 if _calls["n"] == 1 else 29.5
+        return 0.0 if _calls["n"] <= 2 else 29.5
 
     monkeypatch.setattr(runner_mod.time, "monotonic", _fake_monotonic)
 
@@ -2439,3 +2448,279 @@ async def test_apply_platform_auth_propagates_init_failure(tmp_path: Path) -> No
     assert exc_info.value.command == "init"
     assert "S3 bucket does not exist" in exc_info.value.result.stderr
     assert len(spawn_calls) == 1, "must not attempt apply after init fails"
+
+
+# ---------------------------------------------------------------------------
+# Transient infrastructure-provider conflict retry (fix/transient-conflict-
+# retry) — bounded retry for the live 2026-07-29 failure: two concurrent
+# tenant applies (max_concurrent_terraform_runs stays > 1 on purpose) both
+# issue CREATE ROLE + GRANT, contending on Postgres's *shared* catalogs
+# (pg_authid/pg_shdepend) even though each tenant owns a distinct role and
+# schema:
+#
+#   Error: could not execute revoke query: pq: tuple concurrently updated (XX000)
+#     with postgresql_grant.tenant_admin_schema_all
+#
+# _spawn wraps _spawn_once in a bounded retry loop that only fires when a
+# failure's combined stdout+stderr matches a registered
+# _TransientConflictSignature (see _TRANSIENT_CONFLICT_SIGNATURES) — never
+# for a clean failure — and never past the caller's own timeout budget.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected_name"),
+    [
+        ("", "Error: pq: tuple concurrently updated (XX000)", "postgres_tuple_concurrently_updated"),
+        ("", "ERROR:  could not serialize access (SQLSTATE 40001)", "postgres_serialization_failure"),
+        ("", "pq: deadlock_detected", "postgres_deadlock_detected"),
+        ("", "pq: DEADLOCK_DETECTED", "postgres_deadlock_detected"),
+        ("some stdout mentioning 40P01 inline", "", "postgres_deadlock_detected"),
+        ("", 'Error: Unsupported argument "bogus_attr" in resource block', None),
+    ],
+)
+def test_match_transient_conflict_recognises_every_seeded_signature(
+    stdout: str, stderr: str, expected_name: str | None,
+) -> None:
+    """Each seeded registry row (Postgres XX000 / 40001 / 40P01) must be
+    recognised case-insensitively from either stdout or stderr — matched
+    by either the raw SQLSTATE or the condition's human name — and a
+    genuinely unrelated failure (bad HCL) must match nothing."""
+    signature = runner_mod._match_transient_conflict(stdout, stderr)
+    assert (signature.name if signature else None) == expected_name
+
+
+@pytest.mark.asyncio
+async def test_spawn_retries_transient_conflict_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A `terraform apply` that fails with a matched transient-conflict
+    signature must be retried, and a subsequent clean run must succeed —
+    the actual live 2026-07-29 failure mode (tenant b6c10c08, concurrent
+    CREATE ROLE/GRANT against Postgres's shared catalogs)."""
+    import logging
+
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    call_count = {"n": 0}
+
+    class _FlakyThenOkProc:
+        def __init__(self, is_success: bool) -> None:
+            self.returncode = 0 if is_success else 1
+            self._is_success = is_success
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            if self._is_success:
+                return b"Apply complete!", b""
+            return b"", (
+                b"Error: could not execute revoke query: pq: tuple "
+                b"concurrently updated (XX000)\n"
+                b"  with postgresql_grant.tenant_admin_schema_all"
+            )
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        call_count["n"] += 1
+        return _FlakyThenOkProc(is_success=call_count["n"] > 1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    sleep_calls: list[float] = []
+
+    async def _fast_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    caplog.set_level(logging.INFO, logger="terraformer.terraform")
+    result = await runner._spawn(workdir, ["apply"], timeout=30)
+
+    assert result.exit_code == 0
+    assert call_count["n"] == 2, "must retry exactly once after the matched failure"
+    assert sleep_calls == [1.0], "backoff before the single retry must be the base 1.0s"
+    retry_logs = [
+        r for r in caplog.records if "retrying after transient conflict" in r.getMessage()
+    ]
+    assert len(retry_logs) == 1
+    assert "postgres_tuple_concurrently_updated" in retry_logs[0].getMessage()
+    assert "attempt=2/3" in retry_logs[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_spawn_does_not_retry_clean_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure whose combined stdout+stderr matches NO registered
+    transient-conflict signature (a genuine HCL/schema error) must never
+    be retried — turning a fast, permanent failure into 3x the wall-clock
+    for nothing would be strictly worse than failing once."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    call_count = {"n": 0}
+
+    class _CleanFailureProc:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b'Error: Unsupported argument "bogus_attr" in resource block'
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        call_count["n"] += 1
+        return _CleanFailureProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    sleep_calls: list[float] = []
+
+    async def _fast_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    result = await runner._spawn(workdir, ["apply"], timeout=30)
+
+    assert result.exit_code == 1
+    assert call_count["n"] == 1, "a clean (non-matching) failure must not be retried"
+    assert sleep_calls == [], "no backoff sleep for a non-retryable failure"
+
+
+@pytest.mark.asyncio
+async def test_spawn_stops_retrying_when_remaining_budget_cannot_fit_another_attempt(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If the first attempt's own run time already consumed nearly the
+    whole caller `timeout`, the retry loop must give up rather than push
+    past the caller's budget — retries live INSIDE the same total budget
+    queue-wait+run already respects (_effective_run_timeout /
+    _spawn_queue_budget), never past it. Uses real (short, ~1.6s) timing
+    rather than a monkeypatched clock: the retry wrapper reads
+    time.monotonic() both above AND below the nested `_spawn_once` call,
+    so clamping the clock for one level would starve the other's own
+    internal bookkeeping (see the queue-wait tests' clamp-pattern
+    comments above for why that trick doesn't compose across two
+    nested budgets)."""
+    import logging
+
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=1,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    call_count = {"n": 0}
+
+    class _SlowMatchedFailureProc:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            # Consumes most of the 2.0s total `timeout` budget below,
+            # leaving too little remaining for backoff (1.0s) + the
+            # refuse-to-start floor (1s) a retry attempt would need.
+            await asyncio.sleep(1.6)
+            return b"", b"pq: tuple concurrently updated (XX000)"
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        call_count["n"] += 1
+        return _SlowMatchedFailureProc()
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
+        caplog.set_level(logging.INFO, logger="terraformer.terraform")
+        result = await runner._spawn(workdir, ["apply"], timeout=2.0)
+
+    assert result.exit_code == 1
+    assert call_count["n"] == 1, "must not start a second attempt with insufficient budget left"
+    assert any("NOT retrying" in r.getMessage() for r in caplog.records), (
+        "must log why it gave up rather than retry silently"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_bounds_attempts_at_the_configured_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure that matches a transient-conflict signature on EVERY
+    attempt must still stop at _MAX_TRANSIENT_CONFLICT_ATTEMPTS total
+    tries, never loop forever. A generous timeout budget isolates the
+    attempt cap from the budget-exhaustion guard covered above. Also
+    pins the doubling backoff (1s, then 2s) between the 3 attempts."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    call_count = {"n": 0}
+
+    class _AlwaysMatchedFailureProc:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b"pq: tuple concurrently updated (XX000)"
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        call_count["n"] += 1
+        return _AlwaysMatchedFailureProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    sleep_calls: list[float] = []
+
+    async def _fast_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    result = await runner._spawn(workdir, ["apply"], timeout=600)
+
+    assert result.exit_code == 1
+    assert call_count["n"] == runner_mod._MAX_TRANSIENT_CONFLICT_ATTEMPTS == 3
+    assert sleep_calls == [1.0, 2.0], "backoff must double per retry (1s then 2s)"
