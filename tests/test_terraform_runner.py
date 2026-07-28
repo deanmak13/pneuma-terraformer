@@ -594,7 +594,7 @@ async def test_ensure_workspace_writes_backend_tf() -> None:
 # ---------------------------------------------------------------------------
 # Generated vault provider block (feat/openbao-k8s-auth) — replaces the
 # static VAULT_TOKEN. skip_child_token=true is LOAD-BEARING (without it the
-# provider calls auth/token/create even under auth_login_kubernetes, which
+# provider calls auth/token/create even under the kubernetes auth method,
 # 403s against the least-privilege `terraformer` OpenBao policy); role/mount
 # must come from Settings, never a hardcoded literal (design-for-N — a
 # second cluster/role needs no code change).
@@ -613,9 +613,16 @@ async def test_ensure_workspace_writes_vault_provider_file() -> None:
     hcl = provider_tf.read_text()
 
     assert "skip_child_token = true" in hcl
-    assert "auth_login_kubernetes" in hcl
-    assert f'role  = "{settings.vault_k8s_auth_role}"' in hcl
-    assert f'mount = "{settings.vault_k8s_auth_mount}"' in hcl
+    # The vault provider has NO `auth_login_kubernetes` block. Asserting on
+    # that invented name is exactly what let the bug ship: the test only ever
+    # compared the generator's output to itself, so it stayed green while
+    # every real apply died with "Blocks of type auth_login_kubernetes are
+    # not expected here" (2026-07-28). Pin the GENERIC block instead.
+    assert "auth_login_kubernetes {" not in hcl
+    assert "  auth_login {" in hcl
+    assert f'path = "auth/{settings.vault_k8s_auth_mount}/login"' in hcl
+    assert "parameters = {" in hcl
+    assert f'role = "{settings.vault_k8s_auth_role}"' in hcl
     assert 'jwt = file("/var/run/secrets/kubernetes.io/serviceaccount/token")' in hcl
 
 
@@ -646,9 +653,47 @@ async def test_vault_provider_role_and_mount_come_from_settings_not_literals(
     hcl_b = TerraformRunner(settings_b)._vault_provider_hcl()
 
     assert hcl_a != hcl_b
-    assert 'role  = "a-second-cluster-role"' in hcl_b
-    assert 'mount = "kubernetes-secondary"' in hcl_b
+    assert 'role = "a-second-cluster-role"' in hcl_b
+    # The mount is threaded into the generic auth_login path, not a `mount`
+    # attribute — a second cluster/mount still needs config only, no code.
+    assert 'path = "auth/kubernetes-secondary/login"' in hcl_b
+    assert 'path = "auth/kubernetes/login"' in hcl_a
     assert "a-second-cluster-role" not in hcl_a
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("kubernetes", "kubernetes"), ("/kubernetes/", "kubernetes"), (" k8s ", "k8s")],
+)
+def test_auth_mount_is_slash_normalised(tmp_path: Path, raw: str, expected: str) -> None:
+    """The mount is interpolated into `auth/<mount>/login`, so stray slashes
+    would yield a malformed endpoint. Normalisation happens in Settings so
+    the generator never has to re-derive it."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        vault_k8s_auth_mount=raw,
+    )
+    assert settings.vault_k8s_auth_mount == expected
+    _seed_module(settings.terraform_modules_root)
+    assert (
+        f'path = "auth/{expected}/login"'
+        in TerraformRunner(settings)._vault_provider_hcl()
+    )
+
+
+@pytest.mark.parametrize("raw", ["/", "//", "   "])
+def test_auth_mount_rejects_slash_only_values(tmp_path: Path, raw: str) -> None:
+    """`min_length=1` passes "/" — it strips to empty and would render
+    `auth//login`. Reject at config load instead of shipping a broken path."""
+    with pytest.raises(ValueError, match="must name a mount path"):
+        Settings(
+            terraform_workdir_root=tmp_path / "wd",
+            terraform_modules_root=tmp_path / "modules",
+            terraform_binary="/bin/true",
+            vault_k8s_auth_mount=raw,
+        )
 
 
 @pytest.mark.asyncio
@@ -878,7 +923,7 @@ def test_provider_env_includes_four_credential_vars() -> None:
 
 
 def test_provider_env_no_longer_exports_vault_token() -> None:
-    """OpenBao auth moved to auth_login_kubernetes (generated
+    """OpenBao auth moved to kubernetes auth via the generic auth_login block (generated
     provider_vault.tf) — the runner must never source a static
     VAULT_TOKEN from Settings again. A silent fallback to a stored
     token is exactly the failure class this fix removes."""
@@ -2141,7 +2186,7 @@ async def test_ensure_platform_auth_workspace_has_backend_stub_and_no_vault_prov
 ) -> None:
     """This harness must get a backend.tf stub (same reusable-root
     convention as _ensure_workspace) but NEVER the generated
-    provider_vault.tf: that file authenticates via auth_login_kubernetes
+    provider_vault.tf: that file authenticates via the generic auth_login block
     against the very role this harness's job is to create — circular on
     the only occasion this harness ever runs (a cold start)."""
     settings = Settings(
