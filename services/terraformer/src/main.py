@@ -32,6 +32,31 @@ def _configure_logging() -> None:
     )
 
 
+async def _ensure_openbao_auth(settings) -> None:
+    """Bootstrap the terraformer's own OpenBao kubernetes-auth identity —
+    see services.terraformer.src.openbao_bootstrap.ensure_platform_auth
+    for the full converge flow (steady-state no-op vs. cold-start
+    break-glass). Runs BEFORE _sync_capabilities: every provisioning.*
+    capability this pod advertises dispatches to code that needs a
+    working OpenBao identity to apply anything, so proving that identity
+    works is the more useful failure to surface first. Same
+    log-raise-refuse-to-start shape as _sync_capabilities."""
+    logger = logging.getLogger("terraformer.openbao_bootstrap")
+    from services.terraformer.src.openbao_bootstrap import ensure_platform_auth
+    from services.terraformer.src.terraform_runner import get_runner
+
+    try:
+        action = await ensure_platform_auth(settings, get_runner())
+        logger.info("terraformer openbao auth bootstrap complete: action=%s", action)
+    except Exception:
+        logger.exception(
+            "terraformer openbao auth bootstrap FAILED — refusing to start "
+            "without a working OpenBao identity (every tenant apply would "
+            "403 at the vault provider's kubernetes-auth login)."
+        )
+        raise
+
+
 async def _sync_capabilities(settings) -> None:
     """Auto-register Terraformer's provisioning.* gRPC capabilities —
     both the tenant-tier `ProvisioningService` RPCs and the platform-tier
@@ -94,6 +119,7 @@ async def lifespan(app: FastAPI):
         settings.terraform_workdir_root,
         settings.computed_self_url,
     )
+    await _ensure_openbao_auth(settings)
     await _sync_capabilities(settings)
     from services.terraformer.src.grpc_server import start_grpc_server
 

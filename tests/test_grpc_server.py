@@ -271,7 +271,7 @@ async def test_run_tenant_destroy_error_scrubs_secret_and_maps_to_internal() -> 
     the destroy RPC — proves the TerraformError branch (INTERNAL +
     scrubbing) is wired the same way on both mutating RPCs."""
     settings = get_settings()
-    secret = settings.openbao_admin_token
+    secret = settings.rabbitmq_admin_password
     runner = _fake_runner()
     runner.destroy.side_effect = TerraformError(
         "destroy",
