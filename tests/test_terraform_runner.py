@@ -2850,20 +2850,21 @@ async def test_import_preexisting_resources_skips_when_already_in_state(
     workdir.mkdir()
 
     calls: list[list[str]] = []
+    all_addresses = "\n".join(e.resource_address for e in runner_mod._IMPORT_ON_EXISTS_RESOURCES)
 
     async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
         calls.append(args)
-        if args[:2] == ["state", "list"]:
-            return TerraformResult(
-                exit_code=0, stdout="minio_s3_bucket.tenant_media\n", stderr="", outputs={},
-            )
-        raise AssertionError("import must not run when the resource is already in state")
+        if args == ["state", "list"]:
+            return TerraformResult(exit_code=0, stdout=all_addresses + "\n", stderr="", outputs={})
+        raise AssertionError("import must not run when every resource is already in state")
 
     with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
         await runner._import_preexisting_resources(workdir, _stub_inputs())
 
-    assert any(c[:2] == ["state", "list"] for c in calls)
-    assert not any(c[0] == "import" for c in calls)
+    # ONE bulk `state list` call, no per-resource address filter — the fix
+    # this test now guards (2026-08-15 19:01-19:11 incident: 6 separate
+    # per-resource probes/tenant queued on the heavy semaphore).
+    assert calls == [["state", "list"]]
 
 
 @pytest.mark.asyncio
@@ -3131,3 +3132,127 @@ def test_terraform_error_carries_stderr_only_tail() -> None:
     exc = TerraformError("apply", result)
     assert "tenant_acme_app" in str(exc)
     assert "42710" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Follow-up sweep (2026-08-15 19:00 TST): imports worked (SA + both postgres
+# roles adopted), but every apply now costs up to 6 state-list + import
+# spawns/tenant, ALL queued behind the heavy max_concurrent_terraform_runs=2
+# semaphore alongside every apply itself. 4 concurrent tenants' probes
+# queued 19:01→19:11 — the whole ~590s RunTenantReconcile budget burned on
+# queueing, apply never started (no last_apply.log), and each stall
+# consumed a reconcile attempt (7/10 by the time this was caught).
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_issues_exactly_one_bulk_state_list(
+    tmp_path: Path,
+) -> None:
+    """Root fix: ONE `terraform state list` (no address filter) replaces
+    one per-registry-entry probe — collapses ~6 spawns/tenant to 1 +
+    (missing count), and to just 1 once a tenant has converged."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    state_list_calls = 0
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        nonlocal state_list_calls
+        if args == ["state", "list"]:
+            state_list_calls += 1
+            all_addresses = "\n".join(
+                e.resource_address for e in runner_mod._IMPORT_ON_EXISTS_RESOURCES
+            )
+            return TerraformResult(exit_code=0, stdout=all_addresses, stderr="", outputs={})
+        raise AssertionError("no import expected — every registry entry reported in state")
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    assert state_list_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_state_addresses_probe_uses_light_semaphore() -> None:
+    """The bulk state-list probe must route through `light=True` — the
+    wide read-only semaphore — not the heavy apply/import one, or 4
+    concurrent tenants' probes queue behind the same limit=2 slots as
+    every apply (the exact 19:01-19:11 stall)."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = Path("/tmp/nonexistent-ws")
+
+    captured_kwargs: dict = {}
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        captured_kwargs.update(kwargs)
+        return TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        await runner._state_addresses(workdir)
+
+    assert captured_kwargs.get("light") is True
+
+
+def test_read_semaphore_is_wider_than_and_independent_of_heavy_semaphore() -> None:
+    settings = Settings(
+        terraform_workdir_root=Path("/tmp/wd"),
+        terraform_modules_root=Path("/tmp/modules"),
+        max_concurrent_terraform_runs=2,
+    )
+    runner = TerraformRunner(settings)
+    heavy = runner._spawn_semaphore()
+    light = runner._read_spawn_semaphore()
+    assert heavy is not light
+    assert light._value == 2 * runner_mod.TerraformRunner._READ_SEMAPHORE_MULTIPLIER
+    assert light._value > heavy._value
+
+
+@pytest.mark.asyncio
+async def test_light_spawn_bypasses_heavy_semaphore_when_heavy_is_fully_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A light (read-only) spawn must complete even while every heavy slot
+    is held by concurrent applies — proves the semaphores are genuinely
+    independent, not just differently sized."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=1,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    class _FastProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FastProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+
+    # Hold the ONE heavy slot for the duration of this test.
+    heavy_sem = runner._spawn_semaphore()
+    await heavy_sem.acquire()
+    try:
+        result = await asyncio.wait_for(
+            runner._spawn_once(workdir, ["state", "list"], timeout=5, light=True),
+            timeout=1,
+        )
+    finally:
+        heavy_sem.release()
+
+    assert result.exit_code == 0

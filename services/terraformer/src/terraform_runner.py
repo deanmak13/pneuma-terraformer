@@ -456,6 +456,14 @@ class TerraformRunner:
         # outside a running event loop must not bind loop state at
         # construction time.
         self._sem: asyncio.Semaphore | None = None
+        # Separate, wider semaphore for read-only, no-provider-plugin
+        # spawns (`terraform state list` with no address — see
+        # _read_spawn_semaphore). Sharing the heavy apply/import semaphore
+        # here is what caused the 2026-08-15 19:01-19:11 stall: 4 tenants'
+        # cheap state-list probes queued behind the SAME limit=2 slots as
+        # every apply, burning the whole ~590s RunTenantReconcile budget
+        # on queueing before apply ever started.
+        self._read_sem: asyncio.Semaphore | None = None
 
     def _lock_for(self, tenant_id: str) -> asyncio.Lock:
         if tenant_id not in self._locks:
@@ -474,6 +482,31 @@ class TerraformRunner:
         if self._sem is None:
             self._sem = asyncio.Semaphore(self._settings.max_concurrent_terraform_runs)
         return self._sem
+
+    # Fixed multiplier, not a Settings field: read-only spawns
+    # (`terraform state list`, no address) never load provider plugins —
+    # they only read the state file already fetched by init — so the
+    # OOMKill hazard the heavy semaphore guards against (_spawn_semaphore's
+    # docstring: ~5 provider-plugin child processes per heavy spawn) does
+    # not apply. 8x is generous headroom without being unbounded (an
+    # unbounded read semaphore would remove the queue-timeout safety net
+    # entirely for a busy pod).
+    _READ_SEMAPHORE_MULTIPLIER = 8
+
+    def _read_spawn_semaphore(self) -> asyncio.Semaphore:
+        """Wider semaphore for cheap, read-only, no-provider-plugin spawns
+        — currently only the bulk `terraform state list` probe in
+        `_import_preexisting_resources`. See the 2026-08-15 19:01-19:11
+        incident note on `self._read_sem` for why this must NOT share
+        `_spawn_semaphore`'s limit=2: that stall was 4 tenants' cheap
+        state-list probes queued behind the same slots as every heavy
+        apply/import, burning the whole RunTenantReconcile budget on
+        queueing before any apply started."""
+        if self._read_sem is None:
+            self._read_sem = asyncio.Semaphore(
+                self._settings.max_concurrent_terraform_runs * self._READ_SEMAPHORE_MULTIPLIER
+            )
+        return self._read_sem
 
     def _spawn_queue_budget(self, timeout: float) -> int:
         """Seconds a given `_spawn` call may wait to ACQUIRE a concurrency
@@ -654,7 +687,12 @@ class TerraformRunner:
         timeout: float,
         extra_env: dict[str, str] | None = None,
         failure_expected: bool = False,
+        light: bool = False,
     ) -> TerraformResult:
+        # light: this call spawns no provider plugins (currently only the
+        # bulk `terraform state list` probe) — queue on the wider
+        # _read_spawn_semaphore instead of the heavy apply/import one. See
+        # _read_spawn_semaphore's docstring.
         # failure_expected: a non-zero exit is a NORMAL outcome for this
         # call site (e.g. `_import_preexisting_resources` probing a
         # resource that turns out not to pre-exist), so it logs at DEBUG
@@ -731,22 +769,25 @@ class TerraformRunner:
         # acquired, nothing to release" from "acquired, must release"),
         # so the permit is released via an explicit `finally` below,
         # exactly once, only on the branch that actually acquired it.
-        sem = self._spawn_semaphore()
+        sem = self._read_spawn_semaphore() if light else self._spawn_semaphore()
+        sem_limit = (
+            self._settings.max_concurrent_terraform_runs * self._READ_SEMAPHORE_MULTIPLIER
+            if light else self._settings.max_concurrent_terraform_runs
+        )
         queue_budget = self._spawn_queue_budget(timeout)
         if sem.locked():
             _LOG.info(
-                "tf spawn queued (waiting, limit=%d): workdir=%s cmd=%s",
-                self._settings.max_concurrent_terraform_runs, workdir, safe_cmd,
+                "tf spawn queued (waiting, limit=%d, light=%s): workdir=%s cmd=%s",
+                sem_limit, light, workdir, safe_cmd,
             )
         _t0 = time.monotonic()
         try:
             await asyncio.wait_for(sem.acquire(), timeout=queue_budget)
         except asyncio.TimeoutError:
             _LOG.warning(
-                "tf spawn queue timeout after %.1fs (budget=%ds, limit=%d): "
+                "tf spawn queue timeout after %.1fs (budget=%ds, limit=%d, light=%s): "
                 "workdir=%s cmd=%s",
-                time.monotonic() - _t0, queue_budget,
-                self._settings.max_concurrent_terraform_runs, workdir, safe_cmd,
+                time.monotonic() - _t0, queue_budget, sem_limit, light, workdir, safe_cmd,
             )
             return TerraformResult(
                 exit_code=124,
@@ -1083,18 +1124,27 @@ class TerraformRunner:
             return {}
         return {k: v.get("value") for k, v in raw.items()}
 
-    async def _already_in_state(self, workdir: Path, resource_address: str) -> bool:
+    async def _state_addresses(self, workdir: Path) -> set[str]:
+        """ONE bulk `terraform state list` (no address filter) — replaces
+        one per-registry-entry `state list <addr>` probe (2026-08-15
+        19:01-19:11 incident: 4 tenants' per-resource probes queued on the
+        heavy limit=2 semaphore burned the entire ~590s RunTenantReconcile
+        budget before apply ever started; last_apply.log never got
+        written). Runs on the wide, cheap `light=True` semaphore (see
+        _read_spawn_semaphore) since it spawns no provider plugins.
+
+        A non-zero exit (uninitialised/empty state, or a genuine read
+        failure) returns an empty set rather than raising — conservative:
+        every registry entry then gets its import attempted, exactly the
+        old per-resource-probe fallback behaviour, and a real apply-time
+        failure still surfaces from the `apply` step right after this.
+        """
         result = await self._spawn_once(
-            workdir, ["state", "list", resource_address], timeout=30, failure_expected=True,
+            workdir, ["state", "list"], timeout=30, failure_expected=True, light=True,
         )
-        # exit_code 1 with empty stdout means "not in state" (terraform's
-        # documented behaviour for `state list <address>` matching
-        # nothing) — NOT a failure worth raising. Any other non-zero exit
-        # (state file unreadable, backend error, ...) is genuinely
-        # ambiguous; treat conservatively as "not confirmed in state" so
-        # the caller falls through to attempting the import, which itself
-        # fails harmlessly if the address turns out to already be there.
-        return result.exit_code == 0 and bool(result.stdout.strip())
+        if result.exit_code != 0:
+            return set()
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
     async def _import_preexisting_resources(self, workdir: Path, inputs: TenantInputs) -> None:
         """Re-apply-drift convergence (see _IMPORT_ON_EXISTS_RESOURCES):
@@ -1102,14 +1152,15 @@ class TerraformRunner:
         state, attempt `terraform import`. A provider that reports the ID
         does NOT exist fails the import — that failure is swallowed here,
         since it just means the upcoming `apply` will create the resource
-        fresh, exactly as before this fix. Only the "already in state"
-        check and this best-effort import run ahead of `apply`; nothing
-        here can turn a real create-time error into a false convergence,
-        because a genuine apply-time failure still surfaces from the
-        `apply` step itself right after this.
+        fresh, exactly as before this fix. Only the ONE bulk state listing
+        (`_state_addresses`) and this best-effort import run ahead of
+        `apply`; nothing here can turn a real create-time error into a
+        false convergence, because a genuine apply-time failure still
+        surfaces from the `apply` step itself right after this.
         """
+        existing = await self._state_addresses(workdir)
         for entry in _IMPORT_ON_EXISTS_RESOURCES:
-            if await self._already_in_state(workdir, entry.resource_address):
+            if entry.resource_address in existing:
                 continue
             resource_id = entry.resource_id(inputs)
             result = await self._spawn_once(
