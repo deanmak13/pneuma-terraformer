@@ -2851,7 +2851,7 @@ async def test_import_preexisting_resources_skips_when_already_in_state(
 
     calls: list[list[str]] = []
 
-    async def _fake_spawn_once(workdir_, args, timeout):  # noqa: ARG001
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
         calls.append(args)
         if args[:2] == ["state", "list"]:
             return TerraformResult(
@@ -2879,15 +2879,22 @@ async def test_import_preexisting_resources_adopts_pre_existing_bucket(
     workdir = tmp_path / "ws"
     workdir.mkdir()
 
-    async def _fake_spawn_once(workdir_, args, timeout):  # noqa: ARG001
+    bucket_import_args: list[list[str]] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
         if args[:2] == ["state", "list"]:
             return TerraformResult(exit_code=1, stdout="", stderr="No instances", outputs={})
         assert args[0] == "import"
-        assert args[-2:] == ["minio_s3_bucket.tenant_media", "acme-tst-media"]
+        if args[-2] == "minio_s3_bucket.tenant_media":
+            bucket_import_args.append(args)
         return TerraformResult(exit_code=0, stdout="Import successful!", stderr="", outputs={})
 
     with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
         await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    assert bucket_import_args == [
+        ["import", "-input=false", "minio_s3_bucket.tenant_media", "acme-tst-media"],
+    ]
 
 
 @pytest.mark.asyncio
@@ -2902,7 +2909,7 @@ async def test_import_preexisting_resources_swallows_not_found_and_lets_apply_cr
     workdir = tmp_path / "ws"
     workdir.mkdir()
 
-    async def _fake_spawn_once(workdir_, args, timeout):  # noqa: ARG001
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
         if args[:2] == ["state", "list"]:
             return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
         return TerraformResult(
@@ -2941,3 +2948,186 @@ async def test_reconcile_attempts_import_before_apply() -> None:
         await runner.reconcile(_stub_inputs())
 
     assert called["import"] is True
+
+
+# ---------------------------------------------------------------------------
+# Follow-up sweep (2026-08-15, 17:45 TST): bucket import worked but apply
+# then died on kubernetes_service_account.tenant_reader and both
+# postgresql_role.* resources — the registry was too narrow. Also: the
+# failure-tail log line was empty when grepped live even though
+# last_apply.log had the full stderr — an embedded-newline log message
+# gets split across separate container-log records.
+
+@pytest.mark.parametrize(
+    "resource_address,expected_id",
+    [
+        ("kubernetes_service_account.tenant_reader", "platform-tst/tenant-acme-reader"),
+        ("postgresql_role.tenant_app", "tenant_acme_app"),
+        ("postgresql_role.tenant_admin", "tenant_acme_admin"),
+        ("rabbitmq_vhost.tenant", "/acme-tst"),
+        ("rabbitmq_user.tenant", "tenant_acme"),
+        ("minio_s3_bucket.tenant_media", "acme-tst-media"),
+    ],
+)
+def test_import_registry_ids_match_module_naming_convention(
+    resource_address: str, expected_id: str,
+) -> None:
+    entry = next(
+        e for e in runner_mod._IMPORT_ON_EXISTS_RESOURCES if e.resource_address == resource_address
+    )
+    assert entry.resource_id(_stub_inputs()) == expected_id
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_covers_service_account_and_both_roles(
+    tmp_path: Path,
+) -> None:
+    """The three resources the live 17:45 sweep actually hit after the
+    bucket import succeeded — must all be attempted."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    imported: list[str] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        assert args[0] == "import"
+        imported.append(args[-2])
+        return TerraformResult(exit_code=0, stdout="Import successful!", stderr="", outputs={})
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    assert "kubernetes_service_account.tenant_reader" in imported
+    assert "postgresql_role.tenant_app" in imported
+    assert "postgresql_role.tenant_admin" in imported
+
+
+@pytest.mark.asyncio
+async def test_expected_import_probe_failures_log_at_debug_not_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fresh tenant's "not found yet" state-list/import probes must NOT
+    fire the WARNING "tf spawn FAILED" line — that line is for a genuine
+    apply/destroy failure, and every registry entry now probes on every
+    apply, so treating expected probe misses as WARNING would bury the
+    real signal in per-tenant noise."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    class _NotFoundProc:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b"No instances of the given resource address"
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        return _NotFoundProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    with caplog.at_level("DEBUG", logger="terraformer.terraform"):
+        await runner._spawn_once(
+            workdir, ["state", "list", "postgresql_role.tenant_app"],
+            timeout=30, failure_expected=True,
+        )
+
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+    assert any(r.levelname == "DEBUG" and "failed (expected)" in r.message for r in caplog.records)
+
+
+def test_flatten_for_log_collapses_multiline_tail_to_one_line() -> None:
+    multiline = "Error: role already exists\n\n  with postgresql_role.tenant_app,\n  on postgres.tf line 20:\n"
+    flattened = runner_mod._flatten_for_log(multiline)
+    assert "\n" not in flattened
+    assert "Error: role already exists" in flattened
+    assert "postgresql_role.tenant_app" in flattened
+
+
+@pytest.mark.asyncio
+async def test_spawn_once_failure_log_is_single_line_and_carries_stderr_only_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression for the 17:45 sweep: `tail=` logged empty when grepped
+    live, even though last_apply.log had the full stderr — because the
+    old log message embedded raw newlines, which the container log driver
+    splits into separate, unattributed records. The formatted log record
+    itself must now be a single line, and a STDERR-ONLY failure (no
+    stdout at all — the realistic apply-error shape) must still populate
+    a non-empty scrubbed tail."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    class _StderrOnlyFailure:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", (
+                b"Error: creating ServiceAccount: serviceaccounts "
+                b"\"tenant-acme-reader\" already exists\n\n"
+                b"  with kubernetes_service_account.tenant_reader,\n"
+                b"  on eso.tf line 17:\n"
+            )
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        return _StderrOnlyFailure()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    with caplog.at_level("WARNING", logger="terraformer.terraform"):
+        result = await runner._spawn_once(workdir, ["apply"], timeout=30)
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "already exists" in result.stderr
+    failure_records = [r for r in caplog.records if "tf spawn FAILED" in r.message]
+    assert len(failure_records) == 1
+    record = failure_records[0]
+    assert "\n" not in record.message, "the formatted log message must be a single line"
+    assert "already exists" in record.message
+    assert "tenant-acme-reader" in record.message
+    assert record.message.rstrip().endswith(("already exists", "17:")) or "17:" in record.message
+
+
+def test_terraform_error_carries_stderr_only_tail() -> None:
+    """gRPC-propagated error string (grpc_server.py forwards str(exc)) must
+    carry the real cause even when stdout is completely empty — the
+    common apply-failure shape."""
+    result = TerraformResult(
+        exit_code=1,
+        stdout="",
+        stderr="Error: role \"tenant_acme_app\" already exists (SQLSTATE 42710)",
+        outputs={},
+    )
+    exc = TerraformError("apply", result)
+    assert "tenant_acme_app" in str(exc)
+    assert "42710" in str(exc)

@@ -216,11 +216,92 @@ def _tenant_media_bucket_id(inputs: "TenantInputs") -> str:
     return f"{inputs.tenant_slug}-{inputs.env}-media"
 
 
+def _tenant_reader_sa_id(inputs: "TenantInputs") -> str:
+    # terraform-provider-kubernetes import ID convention for namespaced
+    # resources: "<namespace>/<name>" (see hashicorp/terraform-provider-
+    # kubernetes docs, `terraform import kubernetes_service_account.x
+    # <namespace>/<name>`). Mirrors eso.tf's
+    # `kubernetes_service_account.tenant_reader` metadata block exactly —
+    # name = "tenant-${var.tenant_slug}-reader", namespace = var.pooled_
+    # namespace (the runner's own `pooled_namespace` field, unconditionally
+    # set from settings.pneuma_namespace in _tenant_inputs).
+    return f"{inputs.pooled_namespace}/tenant-{inputs.tenant_slug}-reader"
+
+
+def _tenant_app_role_id(inputs: "TenantInputs") -> str:
+    # cyrilgdn/postgresql provider: a postgresql_role's import ID IS the
+    # role name (`terraform import postgresql_role.x <rolename>`) — no
+    # namespace/composite prefix. Mirrors postgres.tf's
+    # `postgresql_role.tenant_app.name = "tenant_${var.tenant_slug}_app"`.
+    return f"tenant_{inputs.tenant_slug}_app"
+
+
+def _tenant_admin_role_id(inputs: "TenantInputs") -> str:
+    # Same convention as _tenant_app_role_id — mirrors postgres.tf's
+    # `postgresql_role.tenant_admin.name = "tenant_${var.tenant_slug}_admin"`.
+    return f"tenant_{inputs.tenant_slug}_admin"
+
+
+def _tenant_vhost_id(inputs: "TenantInputs") -> str:
+    # cyrilgdn/rabbitmq provider: a rabbitmq_vhost's import ID IS the vhost
+    # name, leading slash included (`terraform import rabbitmq_vhost.x
+    # "/some-vhost"`). Mirrors rabbitmq.tf's `rabbitmq_vhost.tenant.name =
+    # "/${var.tenant_slug}-${var.env}"`. Not currently observed to fail
+    # live (RabbitMQ's vhost PUT is idempotent) — registered defensively
+    # per the "if importable" ask, since a future provider/version could
+    # tighten that.
+    return f"/{inputs.tenant_slug}-{inputs.env}"
+
+
+def _tenant_rmq_user_id(inputs: "TenantInputs") -> str:
+    # cyrilgdn/rabbitmq provider: a rabbitmq_user's import ID IS the
+    # username (`terraform import rabbitmq_user.x someuser`). Mirrors
+    # rabbitmq.tf's `rabbitmq_user.tenant.name = "tenant_${var.tenant_slug}"`.
+    # Same defensive registration rationale as _tenant_vhost_id.
+    return f"tenant_{inputs.tenant_slug}"
+
+
+# Deliberately NOT registered: minio_iam_policy.tenant_bucket_rw,
+# minio_iam_user_policy_attachment.tenant, vault_kubernetes_auth_backend_
+# role.tenant, postgresql_grant.* , vault_kv_secret_v2.* — every one of
+# these is backed by a provider-side UPSERT (MinIO policy PUT, Vault KV
+# write, Postgres GRANT, Vault auth-role write), so re-applying over a
+# pre-existing one overwrites cleanly instead of erroring "already
+# exists". Only CREATE-ONLY provider calls (S3 bucket PutBucket, k8s
+# ServiceAccount POST, Postgres CREATE ROLE) belong in this registry — an
+# UPSERT resource added here would be harmless but pointless churn on
+# every apply (an unnecessary import attempt), so it's excluded, not
+# merely unconfirmed.
 _IMPORT_ON_EXISTS_RESOURCES: tuple[_ImportOnExistsResource, ...] = (
     _ImportOnExistsResource(
         name="tenant_media_bucket",
         resource_address="minio_s3_bucket.tenant_media",
         resource_id=_tenant_media_bucket_id,
+    ),
+    _ImportOnExistsResource(
+        name="tenant_reader_service_account",
+        resource_address="kubernetes_service_account.tenant_reader",
+        resource_id=_tenant_reader_sa_id,
+    ),
+    _ImportOnExistsResource(
+        name="tenant_app_role",
+        resource_address="postgresql_role.tenant_app",
+        resource_id=_tenant_app_role_id,
+    ),
+    _ImportOnExistsResource(
+        name="tenant_admin_role",
+        resource_address="postgresql_role.tenant_admin",
+        resource_id=_tenant_admin_role_id,
+    ),
+    _ImportOnExistsResource(
+        name="tenant_rmq_vhost",
+        resource_address="rabbitmq_vhost.tenant",
+        resource_id=_tenant_vhost_id,
+    ),
+    _ImportOnExistsResource(
+        name="tenant_rmq_user",
+        resource_address="rabbitmq_user.tenant",
+        resource_id=_tenant_rmq_user_id,
     ),
 )
 
@@ -304,6 +385,25 @@ def _scrub_secret_shaped(text: str) -> str:
     if not text:
         return text
     return _SECRET_SHAPED_RE.sub(lambda m: f"{m.group(1)}<REDACTED>", text)
+
+
+# Defect (2026-08-15 TST outage, tenant 831acdc5 — follow-up sweep):
+# `_LOG.warning("... tail=\n%s", ..., tail)` puts the tail on lines AFTER
+# the "tail=" prefix. `logging.StreamHandler` writes that whole formatted
+# message — embedded newlines included — in ONE write() call, but the
+# container runtime's log driver splits stdout on every newline into
+# SEPARATE log records. So a line-oriented view (`kubectl logs | grep
+# "tf spawn FAILED"`) only ever surfaces the FIRST line, which ends at
+# "tail=" with nothing after it — the tail content is really there, just
+# on unattributed, unsearched-for follow-up log lines. Evidence: the
+# live 17:46 run's `last_apply.log` (a plain multi-line FILE, not
+# constrained to one log record) had the full stderr the whole time.
+# Flattening to one line before logging (last_apply.log stays multi-line
+# — it's a file, not a log record) makes the tail actually greppable.
+def _flatten_for_log(text: str) -> str:
+    if not text:
+        return text
+    return " | ".join(line for line in text.splitlines() if line.strip())
 
 
 class TerraformError(RuntimeError):
@@ -553,7 +653,15 @@ class TerraformRunner:
         args: list[str],
         timeout: float,
         extra_env: dict[str, str] | None = None,
+        failure_expected: bool = False,
     ) -> TerraformResult:
+        # failure_expected: a non-zero exit is a NORMAL outcome for this
+        # call site (e.g. `_import_preexisting_resources` probing a
+        # resource that turns out not to pre-exist), so it logs at DEBUG
+        # instead of the WARNING "tf spawn FAILED" line below — that line
+        # exists to flag a REAL apply/destroy failure, and firing it on
+        # every fresh-tenant apply's expected "not found, will create"
+        # import probes would bury the genuine signal in noise.
         cmd = [self._settings.terraform_binary, *args]
         # Redact any -backend-config=key=value pairs that carry secrets
         # before logging. Without this, every init logs the MinIO
@@ -742,11 +850,17 @@ class TerraformRunner:
                 # discarded, leaving no trace anywhere of why an apply
                 # failed repeatedly. Log the tail here so a failure is
                 # diagnosable from pod logs alone, without needing to
-                # reproduce the run.
-                _LOG.warning(
-                    "tf spawn FAILED exit=%s workdir=%s cmd=%s tail=\n%s",
-                    proc.returncode, workdir, safe_cmd,
-                    _scrub_secret_shaped(_tail(stderr_s) or _tail(stdout_s)),
+                # reproduce the run. One line, flattened (see
+                # _flatten_for_log) — an embedded-newline message gets
+                # split across separate container-log records by the log
+                # driver, so a line-oriented `grep "tf spawn FAILED"`
+                # would see only the empty prefix up to "tail=".
+                tail = _flatten_for_log(_scrub_secret_shaped(_tail(stderr_s) or _tail(stdout_s)))
+                log = _LOG.debug if failure_expected else _LOG.warning
+                log(
+                    "tf spawn %s exit=%s workdir=%s cmd=%s tail=%s",
+                    "failed (expected)" if failure_expected else "FAILED",
+                    proc.returncode, workdir, safe_cmd, tail,
                 )
             return TerraformResult(
                 exit_code=proc.returncode or 0,
@@ -970,7 +1084,9 @@ class TerraformRunner:
         return {k: v.get("value") for k, v in raw.items()}
 
     async def _already_in_state(self, workdir: Path, resource_address: str) -> bool:
-        result = await self._spawn_once(workdir, ["state", "list", resource_address], timeout=30)
+        result = await self._spawn_once(
+            workdir, ["state", "list", resource_address], timeout=30, failure_expected=True,
+        )
         # exit_code 1 with empty stdout means "not in state" (terraform's
         # documented behaviour for `state list <address>` matching
         # nothing) — NOT a failure worth raising. Any other non-zero exit
@@ -1000,6 +1116,7 @@ class TerraformRunner:
                 workdir,
                 ["import", "-input=false", entry.resource_address, resource_id],
                 timeout=60,
+                failure_expected=True,
             )
             if result.exit_code == 0:
                 _LOG.warning(
