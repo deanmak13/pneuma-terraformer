@@ -86,12 +86,22 @@ def test_capability_rows_carry_grpc_internal_dispatch_shape() -> None:
 
 def test_capability_rows_risk_category_matches_declared_effect() -> None:
     by_name = {row["name"]: row for row in _rows()}
-    # per provisioning_api.proto: apply/destroy = perform_external_action
-    # (operator_only, act); read_tenant_state = read_only (observe).
-    assert by_name["provisioning.apply_tenant_resources"]["effect"] == "perform_external_action"
-    assert by_name["provisioning.apply_tenant_resources"]["risk_category"] == "act"
-    assert by_name["provisioning.destroy_tenant_resources"]["effect"] == "perform_external_action"
-    assert by_name["provisioning.destroy_tenant_resources"]["risk_category"] == "act"
+    # [2026-08-15 chicken-and-egg fix] per provisioning_api.proto: apply/
+    # destroy = mutate_pneuma_state (operator_only, internal) — was
+    # perform_external_action/"act" until this fix, which made a brand-new
+    # tier-0 tenant's own provisioning trip cycle-executor's live-authority
+    # trust-tier gate (LiveAuthorityReclassifiedStricter): a tenant can
+    # never earn the trust tier "act" requires without first being
+    # provisioned. These RPCs create/destroy PLATFORM-owned infrastructure
+    # (OpenBao paths, ESO bindings, RMQ vhost, MinIO bucket, Postgres
+    # schema) executed BY the platform FOR the tenant — internal machinery,
+    # not a tenant-attributed action against a third-party system, per
+    # capability-taxonomy.md §3.1. read_tenant_state stays read_only
+    # (observe) — a plain state read, no side effect.
+    assert by_name["provisioning.apply_tenant_resources"]["effect"] == "mutate_pneuma_state"
+    assert by_name["provisioning.apply_tenant_resources"]["risk_category"] == "internal"
+    assert by_name["provisioning.destroy_tenant_resources"]["effect"] == "mutate_pneuma_state"
+    assert by_name["provisioning.destroy_tenant_resources"]["risk_category"] == "internal"
     assert by_name["provisioning.read_tenant_state"]["effect"] == "read_only"
     assert by_name["provisioning.read_tenant_state"]["risk_category"] == "observe"
 
