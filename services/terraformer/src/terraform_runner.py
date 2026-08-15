@@ -29,9 +29,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -171,6 +173,58 @@ def _normalize_profile(profile: str | None) -> str | None:
     return None if profile.strip().lower() in _NON_REGULATED_SENTINELS else profile
 
 
+# ---------------------------------------------------------------------------
+# Re-apply-drift import registry — LAW: design for N, never for 1. A
+# partially-applied tenant (apply killed mid-run, or the caller retried
+# after a failure) can leave a resource CREATED against the real provider
+# but absent from Terraform state (state write happens only after a
+# resource's create call returns). The next apply then tries to create it
+# again and the provider fatally rejects the duplicate — live 2026-08-15
+# against tenant 831acdc5:
+#
+#   [FATAL] bucket already exists! (journey-co-w31786796546-...-media):
+#     with minio_s3_bucket.tenant_media
+#
+# Each row below names ONE resource address in the tenant module (
+# pneuma-deployments infrastructure/terraform/modules/tenant/) that is
+# known to commonly pre-exist this way, plus how to compute that
+# resource's real-world ID from TenantInputs. `_import_preexisting_
+# resources` treats every row identically — a second resource (e.g. the
+# RabbitMQ vhost, or a Postgres role) that starts exhibiting the same
+# failure mode is a NEW ROW here, never a bespoke import call at the
+# apply call site.
+@dataclass(frozen=True)
+class _ImportOnExistsResource:
+    name: str
+    # Terraform resource address exactly as declared in the tenant module.
+    resource_address: str
+    # Computes the provider-native ID `terraform import` expects for this
+    # resource address, from TenantInputs. Must match the module's own
+    # naming convention exactly (see minio.tf's `bucket_prefix` local /
+    # README.md "Bucket convention").
+    resource_id: Callable[["TenantInputs"], str]
+
+
+def _tenant_media_bucket_id(inputs: "TenantInputs") -> str:
+    # Mirrors minio.tf's `local.bucket_prefix = coalesce(var.minio_bucket_
+    # prefix, var.tenant_slug)` — the runner never sets minio_bucket_prefix
+    # (see _tf_vars), so var.minio_bucket_prefix is always its HCL default
+    # ("") and the coalesce always resolves to tenant_slug. If a future
+    # change threads a prefix override through TenantInputs, this must be
+    # updated in lockstep or the import ID will silently stop matching the
+    # real bucket name.
+    return f"{inputs.tenant_slug}-{inputs.env}-media"
+
+
+_IMPORT_ON_EXISTS_RESOURCES: tuple[_ImportOnExistsResource, ...] = (
+    _ImportOnExistsResource(
+        name="tenant_media_bucket",
+        resource_address="minio_s3_bucket.tenant_media",
+        resource_id=_tenant_media_bucket_id,
+    ),
+)
+
+
 @dataclass(frozen=True)
 class TenantInputs:
     tenant_id: str
@@ -216,12 +270,52 @@ class TerraformResult:
     outputs: dict[str, Any]
 
 
+# Number of trailing lines kept in the gRPC-propagated error string and in
+# the on-failure log line — enough to show the actual terraform provider
+# error (which is often several lines: resource address, error message,
+# provider diagnostic detail) without dumping an entire multi-hundred-line
+# apply transcript into provisioning_runs.error_detail or the pod log.
+_ERROR_TAIL_LINES = 50
+
+
+def _tail(text: str, n: int = _ERROR_TAIL_LINES) -> str:
+    if not text:
+        return ""
+    return "\n".join(text.strip().splitlines()[-n:])
+
+
+# Best-effort scrub for secret-SHAPED substrings in raw terraform
+# stdout/stderr before it ever reaches a log line or the gRPC error detail
+# surfaced to provisioning_runs.error_detail. This is defence-in-depth on
+# top of scrub_credentials() (which redacts KNOWN credential VALUES from
+# Settings) — that function requires the caller to hand it a Settings
+# instance and only catches values this process itself holds. A provider
+# error can also echo back a value we never held explicitly (e.g. a
+# generated password embedded in a resource attribute dump), so this also
+# blanket-redacts any token that LOOKS like a bearer/API key/password
+# assignment, independent of whether we know the value.
+_SECRET_SHAPED_RE = re.compile(
+    r"(?i)\b((?:api[_-]?key|token|password|secret|access[_-]?key)\s*[=:]\s*)"
+    r"(\"?[A-Za-z0-9+/_.\-]{8,}\"?)"
+)
+
+
+def _scrub_secret_shaped(text: str) -> str:
+    if not text:
+        return text
+    return _SECRET_SHAPED_RE.sub(lambda m: f"{m.group(1)}<REDACTED>", text)
+
+
 class TerraformError(RuntimeError):
     def __init__(self, command: str, result: TerraformResult):
         self.command = command
         self.result = result
-        snippet = result.stderr.strip().splitlines()[-20:] if result.stderr else []
-        super().__init__(f"terraform {command} failed (exit={result.exit_code}): " + "\n".join(snippet))
+        # Prefer stderr (where terraform puts provider errors under
+        # -no-color); fall back to stdout for the rarer case where the
+        # failure is reported there instead (e.g. some plan-time errors).
+        snippet = _tail(result.stderr) or _tail(result.stdout)
+        snippet = _scrub_secret_shaped(snippet)
+        super().__init__(f"terraform {command} failed (exit={result.exit_code}): {snippet}")
 
 
 _SECRET_FIELDS = (
@@ -639,10 +733,25 @@ class TerraformRunner:
                     proc.kill()
                     await proc.wait()
 
+            stdout_s = stdout_b.decode("utf-8", errors="replace")
+            stderr_s = stderr_b.decode("utf-8", errors="replace")
+            if proc.returncode:
+                # Defect (2026-08 TST outage, tenant 831acdc5): a failed
+                # apply previously logged ONLY the "tf spawn: ..." dispatch
+                # line above — the actual terraform stdout/stderr was
+                # discarded, leaving no trace anywhere of why an apply
+                # failed repeatedly. Log the tail here so a failure is
+                # diagnosable from pod logs alone, without needing to
+                # reproduce the run.
+                _LOG.warning(
+                    "tf spawn FAILED exit=%s workdir=%s cmd=%s tail=\n%s",
+                    proc.returncode, workdir, safe_cmd,
+                    _scrub_secret_shaped(_tail(stderr_s) or _tail(stdout_s)),
+                )
             return TerraformResult(
                 exit_code=proc.returncode or 0,
-                stdout=stdout_b.decode("utf-8", errors="replace"),
-                stderr=stderr_b.decode("utf-8", errors="replace"),
+                stdout=stdout_s,
+                stderr=stderr_s,
                 outputs={},
             )
         finally:
@@ -860,18 +969,83 @@ class TerraformRunner:
             return {}
         return {k: v.get("value") for k, v in raw.items()}
 
+    async def _already_in_state(self, workdir: Path, resource_address: str) -> bool:
+        result = await self._spawn_once(workdir, ["state", "list", resource_address], timeout=30)
+        # exit_code 1 with empty stdout means "not in state" (terraform's
+        # documented behaviour for `state list <address>` matching
+        # nothing) — NOT a failure worth raising. Any other non-zero exit
+        # (state file unreadable, backend error, ...) is genuinely
+        # ambiguous; treat conservatively as "not confirmed in state" so
+        # the caller falls through to attempting the import, which itself
+        # fails harmlessly if the address turns out to already be there.
+        return result.exit_code == 0 and bool(result.stdout.strip())
+
+    async def _import_preexisting_resources(self, workdir: Path, inputs: TenantInputs) -> None:
+        """Re-apply-drift convergence (see _IMPORT_ON_EXISTS_RESOURCES):
+        for every registered resource not already in this workspace's
+        state, attempt `terraform import`. A provider that reports the ID
+        does NOT exist fails the import — that failure is swallowed here,
+        since it just means the upcoming `apply` will create the resource
+        fresh, exactly as before this fix. Only the "already in state"
+        check and this best-effort import run ahead of `apply`; nothing
+        here can turn a real create-time error into a false convergence,
+        because a genuine apply-time failure still surfaces from the
+        `apply` step itself right after this.
+        """
+        for entry in _IMPORT_ON_EXISTS_RESOURCES:
+            if await self._already_in_state(workdir, entry.resource_address):
+                continue
+            resource_id = entry.resource_id(inputs)
+            result = await self._spawn_once(
+                workdir,
+                ["import", "-input=false", entry.resource_address, resource_id],
+                timeout=60,
+            )
+            if result.exit_code == 0:
+                _LOG.warning(
+                    "tf import: adopted pre-existing %s (%s=%s) into state for tenant_id=%s "
+                    "— re-apply drift recovery",
+                    entry.name, entry.resource_address, resource_id, inputs.tenant_id,
+                )
+            else:
+                _LOG.debug(
+                    "tf import: %s (%s=%s) not found for tenant_id=%s — apply will create it",
+                    entry.name, entry.resource_address, resource_id, inputs.tenant_id,
+                )
+
+    def _persist_last_apply_log(self, workdir: Path, command: str, result: TerraformResult) -> None:
+        """Persist the full (scrubbed) combined stdout+stderr of the most
+        recent apply/destroy to `<workdir>/last_apply.log` — written on
+        BOTH success and failure, overwriting the previous run's log.
+        Unlike the truncated tail in TerraformError/the failure log line,
+        this is the FULL transcript, for postmortems where the 50-line
+        tail isn't enough context. Best-effort: a write failure here must
+        never mask the real apply/destroy result."""
+        try:
+            body = (
+                f"# command: terraform {command}\n"
+                f"# exit_code: {result.exit_code}\n"
+                f"\n--- stdout ---\n{_scrub_secret_shaped(result.stdout)}\n"
+                f"\n--- stderr ---\n{_scrub_secret_shaped(result.stderr)}\n"
+            )
+            (workdir / "last_apply.log").write_text(body)
+        except OSError:
+            _LOG.warning("could not persist last_apply.log in %s", workdir, exc_info=True)
+
     async def reconcile(self, inputs: TenantInputs, timeout: int | None = None) -> TerraformResult:
         effective_timeout = timeout or self._settings.apply_timeout_seconds
         async with self._lock_for(inputs.tenant_id):
             workdir = await self._ensure_workspace(inputs.tenant_id)
             await self._init(workdir, inputs.tenant_id)
             await self._tfvars_file(workdir, inputs)
+            await self._import_preexisting_resources(workdir, inputs)
             try:
                 result = await self._spawn(
                     workdir,
                     ["apply", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
                     timeout=effective_timeout,
                 )
+                self._persist_last_apply_log(workdir, "apply", result)
                 if result.exit_code != 0:
                     raise TerraformError("apply", result)
                 outputs = await self._output_json(workdir)
@@ -899,6 +1073,7 @@ class TerraformRunner:
                     ["destroy", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
                     timeout=effective_timeout,
                 )
+                self._persist_last_apply_log(workdir, "destroy", result)
                 if result.exit_code != 0:
                     raise TerraformError("destroy", result)
                 shutil.rmtree(workdir, ignore_errors=True)
