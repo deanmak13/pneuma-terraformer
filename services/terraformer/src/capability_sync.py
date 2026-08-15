@@ -123,7 +123,10 @@ def _capability_rows(file_descriptors: list[Any], grpc_target: str) -> list[dict
                         "name": name,
                         "display_name": name,
                         "description": meta.description,
-                        "llm_context": meta.llm_description,
+                        # proto 0.84.0 dropped the separate llm_description
+                        # field; description is now the single copy used for
+                        # both the human-facing row and LLM context.
+                        "llm_context": meta.description,
                         "exposure": exposure,
                         "effect": effect,
                         "data_class": data_class,
