@@ -2724,3 +2724,220 @@ async def test_spawn_bounds_attempts_at_the_configured_cap(
     assert result.exit_code == 1
     assert call_count["n"] == runner_mod._MAX_TRANSIENT_CONFLICT_ATTEMPTS == 3
     assert sleep_calls == [1.0, 2.0], "backoff must double per retry (1s then 2s)"
+
+
+# ---------------------------------------------------------------------------
+# Defect 1 — silent failures: a failed terraform run must log its
+# stdout/stderr tail and propagate a meaningful error (2026-08-15, tenant
+# 831acdc5: apply failed repeatedly with no visible terraform output
+# anywhere in terraformer's logs, and RunTenantReconcile returned no
+# detail).
+
+def test_tail_truncates_to_last_n_lines() -> None:
+    text = "\n".join(f"line{i}" for i in range(100))
+    tail = runner_mod._tail(text, n=5)
+    assert tail.splitlines() == [f"line{i}" for i in range(95, 100)]
+
+
+def test_tail_empty_input_returns_empty() -> None:
+    assert runner_mod._tail("") == ""
+
+
+def test_scrub_secret_shaped_redacts_key_value_pairs() -> None:
+    raw = 'token=abcdEFGH12345678 other=short api_key: "sk-1234567890abcd"'
+    scrubbed = runner_mod._scrub_secret_shaped(raw)
+    assert "abcdEFGH12345678" not in scrubbed
+    assert "sk-1234567890abcd" not in scrubbed
+    assert "<REDACTED>" in scrubbed
+    # "other=short" is below the 8-char minimum and must survive untouched.
+    assert "other=short" in scrubbed
+
+
+@pytest.mark.asyncio
+async def test_spawn_once_logs_tail_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    class _FailingProc:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b"Error: bucket already exists! with minio_s3_bucket.tenant_media"
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        return _FailingProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    with caplog.at_level("WARNING", logger="terraformer.terraform"):
+        result = await runner._spawn_once(workdir, ["apply"], timeout=30)
+
+    assert result.exit_code == 1
+    assert any(
+        "tf spawn FAILED" in record.message and "bucket already exists" in record.message
+        for record in caplog.records
+    ), "the terraform stderr tail must land in terraformer's own logs on failure"
+
+
+def test_terraform_error_message_carries_stderr_tail_and_is_scrubbed() -> None:
+    result = TerraformResult(
+        exit_code=1,
+        stdout="",
+        stderr="Error: connection refused password=supersecret1234",
+        outputs={},
+    )
+    exc = TerraformError("apply", result)
+    assert "connection refused" in str(exc)
+    assert "supersecret1234" not in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_persists_last_apply_log_on_failure() -> None:
+    settings = get_settings()
+    _seed_module(settings.terraform_modules_root)
+    runner = TerraformRunner(settings)
+
+    fake_init = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+    fake_apply = TerraformResult(
+        exit_code=1, stdout="", stderr="Error: bucket already exists!", outputs={},
+    )
+    spawn_results = iter([fake_init, fake_apply])
+
+    async def _fake_spawn(workdir, args, timeout):  # noqa: ARG001
+        return next(spawn_results)
+
+    with patch.object(runner, "_spawn", AsyncMock(side_effect=_fake_spawn)):
+        with pytest.raises(TerraformError):
+            await runner.reconcile(_stub_inputs())
+
+    log_path = runner._workspace_dir("t-001") / "last_apply.log"
+    assert log_path.exists()
+    assert "bucket already exists" in log_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Defect 2 — re-apply drift: a re-apply over a half-provisioned tenant must
+# CONVERGE, never fatal (2026-08-15, tenant 831acdc5: `[FATAL] bucket
+# already exists! (...-media): with minio_s3_bucket.tenant_media`).
+
+def test_tenant_media_bucket_id_matches_module_naming_convention() -> None:
+    inputs = _stub_inputs()
+    assert runner_mod._tenant_media_bucket_id(inputs) == "acme-tst-media"
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_skips_when_already_in_state(
+    tmp_path: Path,
+) -> None:
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    calls: list[list[str]] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout):  # noqa: ARG001
+        calls.append(args)
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(
+                exit_code=0, stdout="minio_s3_bucket.tenant_media\n", stderr="", outputs={},
+            )
+        raise AssertionError("import must not run when the resource is already in state")
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    assert any(c[:2] == ["state", "list"] for c in calls)
+    assert not any(c[0] == "import" for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_adopts_pre_existing_bucket(
+    tmp_path: Path,
+) -> None:
+    """The re-apply-drift fix: when the bucket is NOT in state but exists
+    against the real provider (the half-applied-first-run scenario),
+    `terraform import` must be attempted with the exact bucket ID the
+    module itself would compute."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    async def _fake_spawn_once(workdir_, args, timeout):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="No instances", outputs={})
+        assert args[0] == "import"
+        assert args[-2:] == ["minio_s3_bucket.tenant_media", "acme-tst-media"]
+        return TerraformResult(exit_code=0, stdout="Import successful!", stderr="", outputs={})
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_swallows_not_found_and_lets_apply_create(
+    tmp_path: Path,
+) -> None:
+    """A fresh tenant (bucket genuinely doesn't exist yet): the import
+    attempt fails and must NOT raise — the subsequent `apply` creates the
+    resource exactly as it did before this fix."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    async def _fake_spawn_once(workdir_, args, timeout):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        return TerraformResult(
+            exit_code=1, stdout="", stderr="Cannot import non-existent object", outputs={},
+        )
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        # Must not raise.
+        await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+
+@pytest.mark.asyncio
+async def test_reconcile_attempts_import_before_apply() -> None:
+    """Wiring check: reconcile() must run the import-on-exists step before
+    dispatching `apply`, so a half-provisioned tenant converges instead of
+    hitting the provider's fatal duplicate-resource error."""
+    settings = get_settings()
+    _seed_module(settings.terraform_modules_root)
+    runner = TerraformRunner(settings)
+
+    called = {"import": False}
+
+    async def _fake_import(workdir, inputs):  # noqa: ARG001
+        called["import"] = True
+
+    fake_init = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+    fake_apply = TerraformResult(exit_code=0, stdout="{}", stderr="", outputs={})
+    fake_output = TerraformResult(exit_code=0, stdout="{}", stderr="", outputs={})
+    spawn_results = iter([fake_init, fake_apply, fake_output])
+
+    async def _fake_spawn(workdir, args, timeout):  # noqa: ARG001
+        return next(spawn_results)
+
+    with patch.object(runner, "_import_preexisting_resources", AsyncMock(side_effect=_fake_import)), \
+         patch.object(runner, "_spawn", AsyncMock(side_effect=_fake_spawn)):
+        await runner.reconcile(_stub_inputs())
+
+    assert called["import"] is True
