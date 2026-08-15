@@ -47,7 +47,11 @@ FROM hashicorp/terraform:1.9 AS tf
 # RunTenantReconcileRequest.timeout_seconds) remain present — no
 # regression. pr-checks.yml guards against this regressing back to
 # :latest.
-FROM ghcr.io/deanmak13/pneuma-proto:0.49.0 AS proto
+# 0.84.0 (proto PR #155): apply_tenant_resources/destroy_tenant_resources
+# reclassified effect=mutate_pneuma_state (was `act`) — flips the served
+# provisioning capability metadata's risk_category to internal on the next
+# capability sync, pairing with engine main 9bdbfe9f's trust-tier gate fix.
+FROM ghcr.io/deanmak13/pneuma-proto:0.84.0 AS proto
 
 # ---- Terraform provider plugin mirror ----
 # Pre-fetches every provider the tenant module's versions.tf declares so
