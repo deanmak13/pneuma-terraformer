@@ -62,18 +62,23 @@ class LeaseAcquireTimeout(RuntimeError):
 
 
 def _now_rfc3339() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Lease acquireTime/renewTime are metav1.MicroTime fields: the API
+    # server rejects (400 Bad Request) timestamps without exactly six
+    # fractional digits, so `%f` (always six digits) is load-bearing.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _parse_rfc3339(value: str | None) -> float | None:
     if not value:
         return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        ).timestamp()
-    except ValueError:
-        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(value, fmt).replace(
+                tzinfo=timezone.utc
+            ).timestamp()
+        except ValueError:
+            continue
+    return None
 
 
 def _lease_expired(spec: dict[str, Any]) -> bool:
