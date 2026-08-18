@@ -150,6 +150,11 @@ _TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS = 1.0
 # Both must exist for _provider_env() to populate KUBE_*: a pod running
 # without a mounted SA token has no business reconciling k8s-backed
 # tenant resources (ESO SecretStore bindings, RMQ Operator CRDs, ...).
+# ALSO imported by kube_lease_mutex.py — the reconcile-on-change
+# automation's Lease-based single-flight mutex authenticates to the
+# Kubernetes API the same way, so these two paths are this pod's one
+# source of truth for "how do I prove I'm this ServiceAccount", not
+# duplicated per consumer.
 _KUBE_SA_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _KUBE_SA_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 
@@ -323,6 +328,18 @@ class PlatformSecretsInputs:
     platform-secrets module fans canonical OpenBao paths out into
     per-service paths, all cluster-shared. Workspace key:
     `platform-secrets/<env>.tfstate`.
+    """
+
+    env: str  # dev | tst | prod
+
+
+@dataclass(frozen=True)
+class PlatformResourcesInputs:
+    """Inputs to the platform-resources reconcile harness (inter-service
+    HMAC pairs + the ActivePieces least-privilege Postgres role).
+
+    Single env-scoped workspace per cluster, mirrors PlatformSecretsInputs.
+    Workspace key: `platform-resources/<env>.tfstate`.
     """
 
     env: str  # dev | tst | prod
@@ -1402,6 +1419,164 @@ class TerraformRunner:
             finally:
                 self._wipe_tfvars(workdir)
 
+    # --- Platform-resources reconcile (provisioning.apply_platform_resources) ---
+    def _platform_resources_workdir(self, env: str) -> Path:
+        """Single env-scoped workspace per cluster — mirrors
+        _platform_secrets_workdir. Held under workdir_root/_platform_resources/<env>
+        so the same path-traversal defence kicks in on a malformed env."""
+        if env not in ("dev", "tst", "prod"):
+            raise ValueError(f"invalid env {env!r}")
+        root = self._settings.terraform_workdir_root.resolve()
+        candidate = (root / "_platform_resources" / env).resolve()
+        if not str(candidate).startswith(str(root) + "/"):
+            raise ValueError(f"platform-resources env {env!r} escapes workdir root")
+        return candidate
+
+    def _platform_resources_source(self) -> Path:
+        return self._settings.terraform_standalone_root / "platform-resources-apply"
+
+    def _platform_resources_backend_config(self, env: str) -> dict[str, str]:
+        # Same flat-primitives-only shape as every other workspace on this
+        # runner. Key is `platform-resources/<env>.tfstate` — disjoint from
+        # `platform-secrets/<env>.tfstate`, `platform/bus-topology/<env>.tfstate`,
+        # and every per-tenant `tenants/<tenant_id>.tfstate` key.
+        s = self._settings
+        return {
+            "bucket": s.tf_state_backend_bucket,
+            "key": f"platform-resources/{env}.tfstate",
+            "region": s.tf_state_backend_region,
+            "use_path_style": "true",
+            "skip_credentials_validation": "true",
+            "skip_region_validation": "true",
+            "skip_metadata_api_check": "true",
+            "skip_requesting_account_id": "true",
+        }
+
+    def _platform_resources_tfvars(self, inputs: "PlatformResourcesInputs") -> dict[str, str]:
+        # Only `env` — the postgresql provider's host/port/superuser
+        # inputs travel as TF_VAR_* on the subprocess environment (see
+        # _platform_resources_extra_env), never written to this file, for
+        # the same reason PGPASSWORD never lands in a tfvars file
+        # (_provider_env's docstring): a credential-laden tfvars.json
+        # would sit on disk between the write and the _wipe_tfvars in the
+        # `finally` block below.
+        return {"env": inputs.env}
+
+    def _platform_resources_extra_env(self) -> dict[str, str]:
+        """TF_VAR_pg_host / TF_VAR_pg_port / TF_VAR_pg_superuser_password
+        for the platform-resources-apply harness's `postgresql` provider
+        blocks (see that harness's variables — it takes host/port/
+        superuser/password as explicit vars, unlike the tenant module's
+        provider-block-free convention). pg_host/pg_port are read from
+        the SAME ambient PGHOST/PGPORT env vars the pod already carries
+        (pneuma-terraformer chart values.yaml, non-secret cluster config
+        — see PGHOST's REQUIRED comment there); pg_superuser_password
+        reuses the exact credential _provider_env already injects as
+        PGPASSWORD for the tenant module's postgresql provider. Passed
+        as a per-call extra_env (mirrors apply_platform_auth's transient
+        VAULT_TOKEN) rather than folded into _provider_env, since no
+        other workspace on this runner needs a TF_VAR_-prefixed Postgres
+        credential."""
+        s = self._settings
+        host = os.environ.get("PGHOST", "")
+        if not host:
+            raise ValueError(
+                "PGHOST is not set on the terraformer pod environment — "
+                "required by platform-resources-apply's postgresql provider"
+            )
+        return {
+            "TF_VAR_pg_host": host,
+            "TF_VAR_pg_port": os.environ.get("PGPORT", "5432"),
+            "TF_VAR_pg_superuser_password": s.postgres_superuser_password,
+        }
+
+    async def _ensure_platform_resources_workspace(self, env: str) -> Path:
+        workdir = self._platform_resources_workdir(env)
+        workdir.mkdir(parents=True, exist_ok=True)
+        source = self._platform_resources_source()
+        if not source.exists():
+            raise TerraformError(
+                "init",
+                TerraformResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"platform-resources harness not found at {source}",
+                    outputs={},
+                ),
+            )
+        for f in source.iterdir():
+            if f.is_file():
+                shutil.copy2(f, workdir / f.name)
+        # Same vault-provider-block-injection convention as
+        # _ensure_platform_workspace — the harness's own main.tf declares
+        # no `provider "vault" {}` of its own, this runner generates one
+        # fresh into every workspace so auth_login_kubernetes (not a
+        # static token) is what every apply on this runner uses.
+        self._write_vault_provider_file(workdir)
+        return workdir
+
+    async def _init_platform_resources(self, workdir: Path, env: str) -> None:
+        backend_args = []
+        for k, v in self._platform_resources_backend_config(env).items():
+            backend_args.extend(["-backend-config", f"{k}={v}"])
+        result = await self._spawn(
+            workdir,
+            ["init", "-input=false", "-no-color", *backend_args],
+            timeout=self._settings.apply_timeout_seconds,
+        )
+        if result.exit_code != 0:
+            raise TerraformError("init", result)
+
+    async def _platform_resources_tfvars_file(
+        self, workdir: Path, inputs: "PlatformResourcesInputs"
+    ) -> Path:
+        path = workdir / "terraform.tfvars.json"
+        path.write_text(json.dumps(self._platform_resources_tfvars(inputs)))
+        return path
+
+    async def reconcile_platform_resources(
+        self, inputs: "PlatformResourcesInputs"
+    ) -> TerraformResult:
+        """Dispatch target for `provisioning.apply_platform_resources`.
+
+        Runs the standalone harness at
+        `infrastructure/terraform/standalone/platform-resources-apply`
+        against the env-scoped workspace — the platform-tier sibling of
+        `reconcile_platform_secrets`. Currently reconciles two things in
+        one module: the inter-service-HMAC pair seed
+        (modules/platform-resources/inter-service-hmac.tf, `ignore_changes
+        = [data_json]` so a later apply never clobbers an operator's
+        90-day rotation) and the ActivePieces least-privilege Postgres
+        role (AIS-3/INJ-1). Both are create-only/idempotent — a re-apply
+        is a no-op once the pairs and role already exist. Mirrors
+        reconcile_platform_secrets's shape exactly except for the
+        Postgres provider credentials, which travel as TF_VAR_* extra_env
+        (see _platform_resources_extra_env) rather than the tfvars file.
+        """
+        env = inputs.env
+        async with self._lock_for(f"_platform_resources_{env}"):
+            workdir = await self._ensure_platform_resources_workspace(env)
+            await self._init_platform_resources(workdir, env)
+            await self._platform_resources_tfvars_file(workdir, inputs)
+            extra_env = self._platform_resources_extra_env()
+            try:
+                result = await self._spawn(
+                    workdir,
+                    ["apply", "-auto-approve", "-no-color"],
+                    timeout=self._settings.apply_timeout_seconds,
+                    extra_env=extra_env,
+                )
+                if result.exit_code != 0:
+                    raise TerraformError("apply", result)
+                outputs = await self._output_json(workdir)
+                return TerraformResult(
+                    exit_code=result.exit_code,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    outputs=outputs,
+                )
+            finally:
+                self._wipe_tfvars(workdir)
 
     # --- Platform-bus-topology reconcile (provisioning.apply_platform_bus_topology) ---
     def _platform_bus_topology_workdir(self, env: str) -> Path:
