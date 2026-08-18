@@ -32,8 +32,10 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,13 +73,37 @@ _MIN_RUN_SECONDS_AFTER_QUEUE = 1
 #     with postgresql_grant.tenant_admin_schema_all,
 #     on postgres.tf line 49, in resource "postgresql_grant" "tenant_admin_schema_all"
 #
-# Each row below names ONE provider's transient-conflict fingerprint by its
-# SQLSTATE (or vendor equivalent) plus the condition's human name, matched
-# case-insensitively against a failed run's combined stdout+stderr. A 4th
-# signature — another Postgres SQLSTATE, or a RabbitMQ/MinIO/OpenBao
-# equivalent raised by a different provider block — is a NEW ROW here,
-# never an `if "..." in err:` branch at the `_spawn` call site: `_spawn`
-# treats every row identically.
+# A second, unrelated failure class joined this registry 2026-08-18 (see
+# `terraform_provider_grpc_epoll1_abort` below): the SAME "matched
+# signature -> bounded retry" mechanism, but with its OWN attempt count
+# and backoff window, since a fork-timing race clears on a different
+# timescale than a sub-second Postgres catalog lock. Each row below names
+# ONE transient failure's fingerprint (a SQLSTATE/vendor code, a crash
+# assertion string, ...), matched case-insensitively against a failed
+# run's combined stdout+stderr, PLUS that row's own retry shape. A 4th
+# signature is a NEW ROW here, never an `if "..." in err:` branch at the
+# `_spawn` call site: `_spawn` treats every row identically, reading its
+# retry shape from the matched row rather than a shared global.
+
+# Bounded attempts for a `_spawn` dispatch that keeps failing with a
+# matched transient-conflict signature — small and fixed, not a Settings
+# field: terraform apply/init/destroy are idempotent so re-running is
+# safe, but nothing about a deployment's environment should change how
+# many times we blindly retry the SAME queued request before surfacing
+# the failure. This is the DEFAULT every registry row gets unless it sets
+# its own `max_attempts` (see `_TransientConflictSignature` below).
+_MAX_TRANSIENT_CONFLICT_ATTEMPTS = 3
+
+# Backoff before each transient-conflict retry, doubling per retry (1s
+# then 2s, for the 3-attempt default above) — these are catalog-level
+# lock-contention windows measured in milliseconds to low seconds, not a
+# rate-limited external API, so a longer backoff would only eat further
+# into the caller's already-shared timeout budget for no benefit. The
+# DEFAULT every registry row gets unless it sets its own
+# `backoff_base_seconds`.
+_TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS = 1.0
+
+
 @dataclass(frozen=True)
 class _TransientConflictSignature:
     name: str
@@ -87,6 +113,18 @@ class _TransientConflictSignature:
     # text vs. a code appended in parens, as in the live example above) is
     # still recognised.
     patterns: tuple[str, ...]
+    # Per-signature retry shape — defaults reproduce the original
+    # (Postgres catalog-conflict) rows' behaviour exactly, so adding a new
+    # row with a different failure class (see the epoll1-abort row below)
+    # never changes an existing row's attempts/backoff.
+    max_attempts: int = _MAX_TRANSIENT_CONFLICT_ATTEMPTS
+    backoff_base_seconds: float = _TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS
+    # Ceiling on the doubling backoff (backoff_base_seconds * 2**(attempt-
+    # 1)) — None (the original rows' default) leaves it uncapped, fine
+    # when max_attempts is small enough that doubling never grows large.
+    # A row with more attempts (the epoll1-abort row: 5) sets this so
+    # backoff doesn't balloon to minutes on the later attempts.
+    backoff_cap_seconds: float | None = None
 
 
 _TRANSIENT_CONFLICT_SIGNATURES: tuple[_TransientConflictSignature, ...] = (
@@ -113,6 +151,41 @@ _TRANSIENT_CONFLICT_SIGNATURES: tuple[_TransientConflictSignature, ...] = (
         name="postgres_deadlock_detected",
         patterns=("40P01", "deadlock_detected"),
     ),
+    # gRPC C-core epoll1-poller fork-safety abort — live 2026-08-18 against
+    # tenant 72f36de4 (and an earlier, unattributed 2026-08 "round5b"
+    # occurrence with the identical signature): `terraform init`/`apply`
+    # exits -6 (SIGABRT) with stderr
+    #   F ev_epoll1_linux.cc:1121 Check failed: next_worker->state == KICKED
+    #
+    # True crash source is THIS PROCESS, not terraform or a provider
+    # plugin: main.py's lifespan starts a live `grpc.aio.server()`
+    # (grpc_server.py) in the SAME OS process that `_spawn_once` forks via
+    # `asyncio.create_subprocess_exec(..., cwd=str(workdir), ...)` below.
+    # grpcio wraps grpc-core (a C library, not grpc-go) — its background
+    # poller threads are not fork-safe unless fork support is explicitly
+    # enabled (GRPC_ENABLE_FORK_SUPPORT + GRPC_POLL_STRATEGY=poll, set at
+    # the container level — see the terraformer chart's configmap). Passing
+    # `cwd=` forces CPython's subprocess machinery onto the fork+exec path
+    # instead of posix_spawn, so EVERY terraform invocation forks this
+    # process; without fork support the child inherits a torn copy of
+    # grpc-core's epoll1 worker-queue state and asserts before it ever
+    # reaches execve(). This is a documented gRPC bug class (grpc/grpc
+    # #29044, #17253, doc/fork_support.md), not a genuine terraform/HCL
+    # failure — re-running is safe (terraform init/apply are idempotent)
+    # and typically clears on the very next attempt, since it is a
+    # fork-timing race rather than a systemic outage. 5 attempts / 10-30s
+    # backoff (vs. the Postgres rows' 3/1-2s) because the chart-level
+    # mitigation above may not have rolled out to every pod yet — a
+    # longer, more patient retry window covers that gap without leaving a
+    # tenant stuck `provisioning` for the ~15-minute sweeper cycle
+    # (pneuma-engine core:tenant_provisioning_sweeper) to pick up.
+    _TransientConflictSignature(
+        name="terraform_provider_grpc_epoll1_abort",
+        patterns=("ev_epoll1_linux.cc", "next_worker->state == kicked"),
+        max_attempts=5,
+        backoff_base_seconds=10.0,
+        backoff_cap_seconds=30.0,
+    ),
 )
 
 
@@ -128,22 +201,6 @@ def _match_transient_conflict(stdout: str, stderr: str) -> _TransientConflictSig
             return signature
     return None
 
-
-# Bounded attempts for a `_spawn` dispatch that keeps failing with a
-# matched transient-conflict signature — small and fixed, not a Settings
-# field: terraform apply/init/destroy are idempotent so re-running is
-# safe, but nothing about a deployment's environment should change how
-# many times we blindly retry the SAME queued request before surfacing
-# the failure.
-_MAX_TRANSIENT_CONFLICT_ATTEMPTS = 3
-
-# Backoff before each transient-conflict retry, doubling per retry (1s
-# then 2s, for the 3-attempt cap above) — these are catalog-level lock-
-# contention windows measured in milliseconds to low seconds, not a
-# rate-limited external API, so a longer backoff would only eat further
-# into the caller's already-shared timeout budget for no benefit.
-_TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS = 1.0
-
 # Kubernetes ServiceAccount projection paths — module-level constants
 # (not Settings fields) so tests can monkeypatch them directly onto this
 # module without threading a new Settings field through every call site.
@@ -157,6 +214,34 @@ _TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS = 1.0
 # duplicated per consumer.
 _KUBE_SA_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _KUBE_SA_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+
+
+@asynccontextmanager
+async def _no_op_async_cm() -> AsyncIterator[None]:
+    """`async with`-compatible no-op — the out-of-cluster/unit-test arm of
+    `TerraformRunner._tenant_lease_cm` below, where there is no in-cluster
+    Kubernetes API to lease against and the process-local `_lock_for`
+    asyncio.Lock is this environment's only (and, for a single always-up
+    process, already-sufficient) guard. `contextlib.nullcontext()` is NOT
+    usable here — it only implements sync `__enter__`/`__exit__`, not the
+    `__aenter__`/`__aexit__` an `async with` requires."""
+    yield
+
+
+# Margin added to a tenant apply/destroy's own `effective_timeout` when
+# sizing the cross-process Lease `_tenant_lease_cm` acquires (see that
+# method) — NOT a margin on the timed `_spawn` call itself. The Lease is
+# held from BEFORE `_ensure_workspace`/`_init`/`_import_preexisting_
+# resources` even start, none of which are bounded by `effective_timeout`
+# (that budget is only ever passed to the timed `apply`/`destroy` _spawn
+# call) — sizing the lease off `effective_timeout` alone would let it
+# expire, and be stolen, WHILE a legitimate holder is still doing that
+# up-front work, recreating the exact same-tenant collision this mutex
+# exists to prevent (live 2026-08-18, tenant 72f36de4 — see
+# _kill_process_group's docstring). Deliberately generous: a lease that's
+# too long only delays a genuinely crashed holder's slot from
+# self-expiring; a lease that's too short actively re-triggers the bug.
+_TENANT_LEASE_MARGIN_SECONDS = 300
 
 # The pneuma-deployments tenant module's `profile` variable (infrastructure/
 # terraform/modules/tenant/variables.tf) models "non-regulated" as `null` —
@@ -423,6 +508,47 @@ def _flatten_for_log(text: str) -> str:
     return " | ".join(line for line in text.splitlines() if line.strip())
 
 
+def _kill_process_group(proc: Any) -> None:
+    """Kill the ENTIRE process group `_spawn_once` started `proc` into
+    (see `start_new_session=True` on its `asyncio.create_subprocess_exec`
+    call) — not just `proc`'s own PID. `terraform` spawns each provider
+    (postgresql/rabbitmq/minio/vault/kubernetes) as a SEPARATE child
+    process over HashiCorp's go-plugin protocol; a bare `proc.kill()`
+    (SIGKILL to `terraform`'s own PID only) never touches those
+    grandchildren, which can then survive as orphans — reparented to this
+    container's PID 1 — and keep running against a live provider
+    connection.
+
+    Live 2026-08-18 against tenant 72f36de4: a caller-side retry
+    cancelled an in-flight `reconcile()` at 20:06; the cancelled
+    `_spawn_once` correctly killed the immediate `terraform` PID, but its
+    already-forked `terraform-provider-postgresql` plugin process
+    survived as an orphan and kept executing its REVOKE. A fresh 20:10
+    retry for the SAME tenant then collided with it —
+    `pq: tuple concurrently updated (XX000)` — two attempts for one
+    tenant genuinely running concurrently despite `_lock_for`'s per-tenant
+    asyncio.Lock, because that Lock only ever serialises NEW `_spawn`
+    calls; it cannot reach into an already-orphaned previous attempt's
+    surviving subprocess tree.
+
+    `os.getpgid`/`os.killpg` require a real PID — deliberately broad
+    `except` below so a `proc` that HAS no real PID (every existing unit
+    test's fake process double) or has already exited falls straight back
+    to the always-correct, already-tested `proc.kill()`. Production
+    `proc` objects are real `asyncio.subprocess.Process` instances with a
+    real `pid`, so the group-kill path is what actually fires there.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        return
+    except (AttributeError, ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 class TerraformError(RuntimeError):
     def __init__(self, command: str, result: TerraformResult):
         self.command = command
@@ -486,6 +612,50 @@ class TerraformRunner:
         if tenant_id not in self._locks:
             self._locks[tenant_id] = asyncio.Lock()
         return self._locks[tenant_id]
+
+    def _tenant_lease_cm(self, tenant_id: str, effective_timeout: float) -> Any:
+        """`async with` this around the WHOLE plan/apply (or destroy)
+        cycle, nested INSIDE `_lock_for`'s process-local lock — see
+        reconcile()/destroy()'s call sites. Cross-process/cross-restart
+        single-flight, on top of (never instead of) that local lock:
+        `_lock_for`'s asyncio.Lock lives only in THIS process's memory,
+        so it offers zero protection across a pod restart (exactly what
+        the epoll1-abort crash mitigated elsewhere in this module can
+        trigger) or, if this chart is ever scaled beyond `replicas: 1`,
+        across a second replica. A Kubernetes Lease is durable
+        orchestration/coordination state — the SAME category
+        `kube_lease_mutex.py`'s reconcile_cli.py caller already uses for
+        the platform-secrets/platform-resources reconcile (NOT a
+        Terraform-CLI-bypassing infra mutation; see that module's
+        docstring) — so it survives exactly the restart the local lock
+        does not.
+
+        No-ops (returns `_no_op_async_cm()`) when this pod has no
+        projected ServiceAccount token — mirrors `_provider_env`'s
+        identical in-cluster check — so every existing unit test (none
+        of which stands up an in-cluster Kubernetes API) keeps
+        exercising only the already-proven `_lock_for` path, unchanged.
+        """
+        if not (_KUBE_SA_TOKEN_PATH.exists() and _KUBE_SA_CA_CERT_PATH.exists()):
+            return _no_op_async_cm()
+        from services.terraformer.src.kube_lease_mutex import KubeLeaseMutex
+
+        duration = int(effective_timeout) + _TENANT_LEASE_MARGIN_SECONDS
+        return KubeLeaseMutex(
+            f"tf-tenant-{tenant_id}",
+            lease_duration_seconds=duration,
+            # Bounded, not unbounded: a caller that waited this long for
+            # another holder to finish was already past any sane RPC
+            # deadline — failing fast with a clear LeaseAcquireTimeout
+            # beats hanging silently past it.
+            acquire_timeout_seconds=duration,
+            # Faster than KubeLeaseMutex's own 5s default — a tenant
+            # apply that's actually queued behind another one should
+            # notice the lease freed up promptly rather than adding up
+            # to another ~5s of dead waiting on top of whatever the held
+            # apply's own real runtime already cost it.
+            poll_interval_seconds=2.0,
+        )
 
     def _spawn_semaphore(self) -> asyncio.Semaphore:
         """Process-wide cap on concurrent terraform subprocesses (get_runner()
@@ -671,17 +841,24 @@ class TerraformRunner:
             if result.exit_code == 0:
                 return result
             signature = _match_transient_conflict(result.stdout, result.stderr)
-            if signature is None or attempt >= _MAX_TRANSIENT_CONFLICT_ATTEMPTS:
+            # Attempts/backoff come from the MATCHED signature, never a
+            # shared global — see _TransientConflictSignature's fields:
+            # a fork-timing crash (5 attempts, 10-30s) and a sub-second
+            # Postgres catalog lock (3 attempts, 1-2s) clear on genuinely
+            # different timescales.
+            if signature is None or attempt >= signature.max_attempts:
                 return result
 
-            backoff = _TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            backoff = signature.backoff_base_seconds * (2 ** (attempt - 1))
+            if signature.backoff_cap_seconds is not None:
+                backoff = min(backoff, signature.backoff_cap_seconds)
             remaining = timeout - (time.monotonic() - overall_start)
             if remaining <= backoff + _MIN_RUN_SECONDS_AFTER_QUEUE:
                 _LOG.warning(
                     "tf spawn NOT retrying transient conflict signature=%s "
                     "(attempt %d/%d): only %.1fs of the %.1fs budget remains, "
                     "below backoff+floor (%.1fs+%ds): workdir=%s cmd=%s",
-                    signature.name, attempt, _MAX_TRANSIENT_CONFLICT_ATTEMPTS,
+                    signature.name, attempt, signature.max_attempts,
                     remaining, timeout, backoff, _MIN_RUN_SECONDS_AFTER_QUEUE,
                     workdir, args[0] if args else "<no-args>",
                 )
@@ -691,7 +868,7 @@ class TerraformRunner:
             _LOG.info(
                 "tf spawn retrying after transient conflict: signature=%s "
                 "attempt=%d/%d workdir=%s cmd=%s",
-                signature.name, attempt, _MAX_TRANSIENT_CONFLICT_ATTEMPTS,
+                signature.name, attempt, signature.max_attempts,
                 workdir, args[0] if args else "<no-args>",
             )
             await asyncio.sleep(backoff)
@@ -874,6 +1051,14 @@ class TerraformRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # New session (setsid) so `terraform` and every provider
+                # plugin process it forks (postgresql/rabbitmq/minio/
+                # vault/kubernetes, over HashiCorp's go-plugin protocol)
+                # land in a process group OF THEIR OWN — never this
+                # service's own group. Required for `_kill_process_group`
+                # below to be able to kill the WHOLE tree via
+                # `os.killpg` without risking hitting this process itself.
+                start_new_session=True,
             )
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=remaining)
@@ -894,9 +1079,14 @@ class TerraformRunner:
                 # above was catching pre-fix — leaving terraform and its
                 # ~5 provider children alive and unreaped while the freed
                 # permit let a queued run start, so live processes
-                # silently exceeded the concurrency limit.
+                # silently exceeded the concurrency limit. Kills the
+                # WHOLE process group (see _kill_process_group), not just
+                # `terraform`'s own PID — a bare proc.kill() left orphaned
+                # provider-plugin grandchildren running past this point
+                # (live 2026-08-18, tenant 72f36de4 — see
+                # _kill_process_group's docstring).
                 if proc.returncode is None:
-                    proc.kill()
+                    _kill_process_group(proc)
                     await proc.wait()
 
             stdout_s = stdout_b.decode("utf-8", errors="replace")
@@ -1219,55 +1409,80 @@ class TerraformRunner:
 
     async def reconcile(self, inputs: TenantInputs, timeout: int | None = None) -> TerraformResult:
         effective_timeout = timeout or self._settings.apply_timeout_seconds
+        from services.terraformer.src.kube_lease_mutex import LeaseAcquireTimeout
+
         async with self._lock_for(inputs.tenant_id):
-            workdir = await self._ensure_workspace(inputs.tenant_id)
-            await self._init(workdir, inputs.tenant_id)
-            await self._tfvars_file(workdir, inputs)
-            await self._import_preexisting_resources(workdir, inputs)
             try:
-                result = await self._spawn(
-                    workdir,
-                    ["apply", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
-                    timeout=effective_timeout,
-                )
-                self._persist_last_apply_log(workdir, "apply", result)
-                if result.exit_code != 0:
-                    raise TerraformError("apply", result)
-                outputs = await self._output_json(workdir)
-                return TerraformResult(
-                    exit_code=result.exit_code,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    outputs=outputs,
-                )
-            finally:
-                # Wipe the credential-laden tfvars file regardless of
-                # success/failure — never leave admin tokens on disk
-                # between runs.
-                self._wipe_tfvars(workdir)
+                async with self._tenant_lease_cm(inputs.tenant_id, effective_timeout):
+                    workdir = await self._ensure_workspace(inputs.tenant_id)
+                    await self._init(workdir, inputs.tenant_id)
+                    await self._tfvars_file(workdir, inputs)
+                    await self._import_preexisting_resources(workdir, inputs)
+                    try:
+                        result = await self._spawn(
+                            workdir,
+                            ["apply", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
+                            timeout=effective_timeout,
+                        )
+                        self._persist_last_apply_log(workdir, "apply", result)
+                        if result.exit_code != 0:
+                            raise TerraformError("apply", result)
+                        outputs = await self._output_json(workdir)
+                        return TerraformResult(
+                            exit_code=result.exit_code,
+                            stdout=result.stdout,
+                            stderr=result.stderr,
+                            outputs=outputs,
+                        )
+                    finally:
+                        # Wipe the credential-laden tfvars file regardless
+                        # of success/failure — never leave admin tokens on
+                        # disk between runs.
+                        self._wipe_tfvars(workdir)
+            except LeaseAcquireTimeout as exc:
+                # Reuses the exact exit_code=124 sentinel _spawn's own
+                # timeout paths already return — grpc_server.py's
+                # _terraform_error_code and routes/provisioning.py both
+                # already classify that as "ran out of time", so a caller
+                # gets the same DEADLINE_EXCEEDED treatment for "another
+                # apply is still holding this tenant" as for any other
+                # timeout, with zero changes needed at either call site.
+                raise TerraformError(
+                    "lease_acquire",
+                    TerraformResult(exit_code=124, stdout="", stderr=str(exc), outputs={}),
+                ) from exc
 
     async def destroy(self, inputs: TenantInputs, timeout: int | None = None) -> TerraformResult:
         effective_timeout = timeout or self._settings.destroy_timeout_seconds
+        from services.terraformer.src.kube_lease_mutex import LeaseAcquireTimeout
+
         async with self._lock_for(inputs.tenant_id):
-            workdir = await self._ensure_workspace(inputs.tenant_id)
-            await self._init(workdir, inputs.tenant_id)
-            await self._tfvars_file(workdir, inputs)
             try:
-                result = await self._spawn(
-                    workdir,
-                    ["destroy", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
-                    timeout=effective_timeout,
-                )
-                self._persist_last_apply_log(workdir, "destroy", result)
-                if result.exit_code != 0:
-                    raise TerraformError("destroy", result)
-                shutil.rmtree(workdir, ignore_errors=True)
-                self._locks.pop(inputs.tenant_id, None)
-                return result
-            finally:
-                # Belt-and-braces: if shutil.rmtree didn't fire (early
-                # raise), at least wipe the tfvars file.
-                self._wipe_tfvars(workdir)
+                async with self._tenant_lease_cm(inputs.tenant_id, effective_timeout):
+                    workdir = await self._ensure_workspace(inputs.tenant_id)
+                    await self._init(workdir, inputs.tenant_id)
+                    await self._tfvars_file(workdir, inputs)
+                    try:
+                        result = await self._spawn(
+                            workdir,
+                            ["destroy", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
+                            timeout=effective_timeout,
+                        )
+                        self._persist_last_apply_log(workdir, "destroy", result)
+                        if result.exit_code != 0:
+                            raise TerraformError("destroy", result)
+                        shutil.rmtree(workdir, ignore_errors=True)
+                        self._locks.pop(inputs.tenant_id, None)
+                        return result
+                    finally:
+                        # Belt-and-braces: if shutil.rmtree didn't fire
+                        # (early raise), at least wipe the tfvars file.
+                        self._wipe_tfvars(workdir)
+            except LeaseAcquireTimeout as exc:
+                raise TerraformError(
+                    "lease_acquire",
+                    TerraformResult(exit_code=124, stdout="", stderr=str(exc), outputs={}),
+                ) from exc
 
     async def state(self, tenant_id: str) -> dict[str, Any]:
         """Read-only state inspection. Does NOT init or apply — runs

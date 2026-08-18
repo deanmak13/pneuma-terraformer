@@ -2476,16 +2476,22 @@ async def test_apply_platform_auth_propagates_init_failure(tmp_path: Path) -> No
         ("", "pq: deadlock_detected", "postgres_deadlock_detected"),
         ("", "pq: DEADLOCK_DETECTED", "postgres_deadlock_detected"),
         ("some stdout mentioning 40P01 inline", "", "postgres_deadlock_detected"),
+        (
+            "",
+            "F ev_epoll1_linux.cc:1121 Check failed: next_worker->state == KICKED",
+            "terraform_provider_grpc_epoll1_abort",
+        ),
         ("", 'Error: Unsupported argument "bogus_attr" in resource block', None),
     ],
 )
 def test_match_transient_conflict_recognises_every_seeded_signature(
     stdout: str, stderr: str, expected_name: str | None,
 ) -> None:
-    """Each seeded registry row (Postgres XX000 / 40001 / 40P01) must be
-    recognised case-insensitively from either stdout or stderr — matched
-    by either the raw SQLSTATE or the condition's human name — and a
-    genuinely unrelated failure (bad HCL) must match nothing."""
+    """Each seeded registry row (Postgres XX000 / 40001 / 40P01, plus the
+    gRPC epoll1 fork-safety abort) must be recognised case-insensitively
+    from either stdout or stderr — matched by either the raw
+    SQLSTATE/vendor code or the condition's human name — and a genuinely
+    unrelated failure (bad HCL) must match nothing."""
     signature = runner_mod._match_transient_conflict(stdout, stderr)
     assert (signature.name if signature else None) == expected_name
 
@@ -3256,3 +3262,317 @@ async def test_light_spawn_bypasses_heavy_semaphore_when_heavy_is_fully_held(
         heavy_sem.release()
 
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# gRPC epoll1 fork-safety abort — crash-signature classification, process-
+# group kill, and per-tenant cross-process single-flight (live 2026-08-18,
+# tenant 72f36de4: `terraform init`/`apply` intermittently aborts with
+#   F ev_epoll1_linux.cc:1121 Check failed: next_worker->state == KICKED
+# — exit=-6/SIGABRT). True crash source is THIS process's own live
+# `grpc.aio.server()` (grpc_server.py) sharing an OS process with every
+# `asyncio.create_subprocess_exec` fork in terraform_runner.py — see
+# _TRANSIENT_CONFLICT_SIGNATURES' `terraform_provider_grpc_epoll1_abort`
+# row and _kill_process_group's docstring for the full incident writeup.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_retries_epoll1_abort_signature_with_its_own_attempts_and_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The epoll1-abort signature gets its OWN retry shape (5 attempts,
+    10/20/30/30s backoff — capped at 30s) — NOT the Postgres rows' shared
+    3-attempts/1-2s shape — because a fork-timing race clears on a
+    different timescale than a sub-second catalog lock. Fails 4 times
+    with the exact live stderr signature, succeeds on the 5th."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    call_count = {"n": 0}
+
+    class _EpollAbortThenOkProc:
+        def __init__(self, is_success: bool) -> None:
+            self.returncode = 0 if is_success else -6
+            self._is_success = is_success
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            if self._is_success:
+                return b"Apply complete!", b""
+            return (
+                b"",
+                b"F ev_epoll1_linux.cc:1121 Check failed: next_worker->state == KICKED",
+            )
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        call_count["n"] += 1
+        return _EpollAbortThenOkProc(is_success=call_count["n"] > 4)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    sleep_calls: list[float] = []
+
+    async def _fast_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    result = await runner._spawn(workdir, ["init"], timeout=600)
+
+    assert result.exit_code == 0
+    assert call_count["n"] == 5, "must retry 4 times (5 attempts total) before succeeding"
+    assert sleep_calls == [10.0, 20.0, 30.0, 30.0], "backoff must double then cap at 30s"
+
+
+@pytest.mark.asyncio
+async def test_spawn_stops_retrying_epoll1_abort_after_5_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that NEVER clears must stop at the epoll1 row's own 5-attempt
+    cap and surface the last failure — never retry forever."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    call_count = {"n": 0}
+
+    class _AlwaysAbortsProc:
+        returncode = -6
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"",
+                b"F ev_epoll1_linux.cc:1121 Check failed: next_worker->state == KICKED",
+            )
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            return None
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        call_count["n"] += 1
+        return _AlwaysAbortsProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    result = await runner._spawn(workdir, ["init"], timeout=600)
+
+    assert result.exit_code == -6
+    assert call_count["n"] == 5, "must stop after exactly 5 attempts, never retry forever"
+
+
+def test_kill_process_group_kills_the_whole_group_when_pid_is_real(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a real PID, `_kill_process_group` must `os.killpg` the WHOLE
+    group (SIGKILL) — NOT just `proc.kill()` the immediate PID — so a
+    `terraform` provider-plugin grandchild (postgresql/rabbitmq/minio/
+    vault/kubernetes, forked over HashiCorp's go-plugin protocol) can
+    never survive as an orphan past a cancelled/timed-out apply. This is
+    the actual live 2026-08-18 same-tenant collision fix (tenant
+    72f36de4) — see the function's own docstring."""
+    import signal as signal_mod
+
+    killpg_calls: list[tuple[int, int]] = []
+    kill_calls: list[bool] = []
+
+    class _RealPidProc:
+        pid = 4321
+
+        def kill(self) -> None:
+            kill_calls.append(True)
+
+    monkeypatch.setattr(runner_mod.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        runner_mod.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig))
+    )
+
+    runner_mod._kill_process_group(_RealPidProc())
+
+    assert killpg_calls == [(4321, signal_mod.SIGKILL)]
+    assert kill_calls == [], "must not ALSO fall back to proc.kill() when the group-kill succeeded"
+
+
+def test_kill_process_group_falls_back_to_proc_kill_without_a_real_pid() -> None:
+    """A `proc` with no real `.pid` (every existing fake-process test
+    double in this file) must fall straight back to the always-correct
+    `proc.kill()` — the group-kill enhancement must never regress the
+    guaranteed base behaviour."""
+    kill_calls: list[bool] = []
+
+    class _NoPidProc:
+        def kill(self) -> None:
+            kill_calls.append(True)
+
+    runner_mod._kill_process_group(_NoPidProc())
+
+    assert kill_calls == [True]
+
+
+def test_tenant_lease_cm_is_noop_without_incluster_service_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No projected ServiceAccount token (every unit test's environment,
+    and a local dev shell) — `_tenant_lease_cm` must return the no-op CM,
+    so `reconcile()`/`destroy()` fall back to `_lock_for`'s process-local
+    lock alone, exactly today's behaviour."""
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setattr(runner_mod, "_KUBE_SA_TOKEN_PATH", missing)
+    monkeypatch.setattr(runner_mod, "_KUBE_SA_CA_CERT_PATH", missing)
+
+    runner = TerraformRunner(get_settings())
+    cm = runner._tenant_lease_cm("t-001", 600)
+
+    assert cm.__class__.__name__ == "_AsyncGeneratorContextManager"
+
+
+def test_tenant_lease_cm_returns_kube_lease_mutex_when_incluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A projected ServiceAccount token present (the in-cluster case) —
+    `_tenant_lease_cm` must hand back a real per-tenant `KubeLeaseMutex`,
+    named so a DIFFERENT tenant can never collide on the same Lease, sized
+    to cover the WHOLE plan/apply cycle (not just the timed apply step —
+    see _TENANT_LEASE_MARGIN_SECONDS's docstring)."""
+    from services.terraformer.src.kube_lease_mutex import KubeLeaseMutex
+
+    token = tmp_path / "token"
+    ca = tmp_path / "ca.crt"
+    token.write_text("fake-token")
+    ca.write_text("fake-ca")
+    monkeypatch.setattr(runner_mod, "_KUBE_SA_TOKEN_PATH", token)
+    monkeypatch.setattr(runner_mod, "_KUBE_SA_CA_CERT_PATH", ca)
+    monkeypatch.setenv("PNEUMA_NAMESPACE", "platform-tst")
+
+    runner = TerraformRunner(get_settings())
+    cm = runner._tenant_lease_cm("t-001", 600)
+
+    assert isinstance(cm, KubeLeaseMutex)
+    assert cm.name == "tf-tenant-t-001"
+    assert cm.lease_duration_seconds == 600 + runner_mod._TENANT_LEASE_MARGIN_SECONDS
+    assert cm.acquire_timeout_seconds == 600 + runner_mod._TENANT_LEASE_MARGIN_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_reconcile_serializes_two_runner_instances_via_tenant_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-process single-flight regression guard (live 2026-08-18,
+    tenant 72f36de4 — see _kill_process_group's docstring): TWO SEPARATE
+    `TerraformRunner` instances — each with its OWN process-local
+    `_locks` dict, simulating two workers/pod-restarts that share no
+    in-memory state — must still serialise a `reconcile()` for the SAME
+    tenant_id via the Kubernetes Lease `_tenant_lease_cm` acquires. The
+    second instance's apply must NOT start while the first still holds
+    the lease, and must proceed once the first releases it.
+
+    Exercises the REAL `KubeLeaseMutex` acquire/steal/release HTTP calls
+    against an in-memory fake `coordination.k8s.io/v1` Leases API (only
+    GET/POST/PUT on one named Lease are needed) rather than mocking
+    `KubeLeaseMutex` away — this is also the first test coverage
+    `kube_lease_mutex.py` has ever had."""
+    import httpx
+
+    from services.terraformer.src.kube_lease_mutex import KubeLeaseMutex
+
+    token = tmp_path / "token"
+    ca = tmp_path / "ca.crt"
+    token.write_text("fake-token")
+    ca.write_text("fake-ca")
+    monkeypatch.setattr(runner_mod, "_KUBE_SA_TOKEN_PATH", token)
+    monkeypatch.setattr(runner_mod, "_KUBE_SA_CA_CERT_PATH", ca)
+    monkeypatch.setenv("PNEUMA_NAMESPACE", "platform-tst")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.43.0.1")
+
+    leases: dict[str, dict] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        name = request.url.path.rsplit("/", 1)[-1]
+        if request.method == "GET":
+            if name in leases:
+                return httpx.Response(200, json=leases[name])
+            return httpx.Response(404, json={})
+        if request.method == "POST":
+            body = json.loads(request.content)
+            leases[body["metadata"]["name"]] = body
+            return httpx.Response(201, json=body)
+        if request.method == "PUT":
+            body = json.loads(request.content)
+            leases[name] = body
+            return httpx.Response(200, json=body)
+        raise AssertionError(f"unexpected method {request.method}")  # pragma: no cover
+
+    def _fake_client(self: KubeLeaseMutex) -> httpx.AsyncClient:  # noqa: ARG001
+        return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+
+    monkeypatch.setattr(KubeLeaseMutex, "_client", _fake_client)
+
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    _seed_module(settings.terraform_modules_root)
+
+    runner_a = TerraformRunner(settings)
+    runner_b = TerraformRunner(settings)
+
+    order: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _fake_spawn_a(workdir, args, timeout):  # noqa: ARG001
+        order.append("a-start")
+        first_started.set()
+        await release_first.wait()
+        order.append("a-end")
+        return TerraformResult(exit_code=0, stdout="{}", stderr="", outputs={})
+
+    async def _fake_spawn_b(workdir, args, timeout):  # noqa: ARG001
+        order.append("b-start")
+        return TerraformResult(exit_code=0, stdout="{}", stderr="", outputs={})
+
+    with patch.object(runner_a, "_spawn", AsyncMock(side_effect=_fake_spawn_a)), \
+         patch.object(runner_b, "_spawn", AsyncMock(side_effect=_fake_spawn_b)):
+        task_a = asyncio.ensure_future(runner_a.reconcile(_stub_inputs()))
+        await asyncio.wait_for(first_started.wait(), timeout=5)
+
+        task_b = asyncio.ensure_future(runner_b.reconcile(_stub_inputs()))
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task_b), timeout=0.5)
+        assert "b-start" not in order, (
+            "the second runner instance must not start its apply while the "
+            "first still holds the tenant Lease"
+        )
+
+        release_first.set()
+        await asyncio.wait_for(task_a, timeout=5)
+        await asyncio.wait_for(task_b, timeout=10)
+
+    assert order[0] == "a-start"
+    assert order.index("b-start") > order.index("a-end"), (
+        "the second runner must only start AFTER the first released the lease"
+    )
