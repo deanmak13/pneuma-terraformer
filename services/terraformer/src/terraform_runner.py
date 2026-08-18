@@ -148,6 +148,11 @@ _TRANSIENT_CONFLICT_BACKOFF_BASE_SECONDS = 1.0
 # Both must exist for _provider_env() to populate KUBE_*: a pod running
 # without a mounted SA token has no business reconciling k8s-backed
 # tenant resources (ESO SecretStore bindings, RMQ Operator CRDs, ...).
+# ALSO imported by kube_lease_mutex.py — the reconcile-on-change
+# automation's Lease-based single-flight mutex authenticates to the
+# Kubernetes API the same way, so these two paths are this pod's one
+# source of truth for "how do I prove I'm this ServiceAccount", not
+# duplicated per consumer.
 _KUBE_SA_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _KUBE_SA_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 

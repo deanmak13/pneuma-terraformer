@@ -105,7 +105,18 @@ async def _reconcile_platform_resources(env: str) -> None:
     )
 
 
+_LEASE_NAME = "platform-secrets-reconcile"
+# Matches the CronJob's own activeDeadlineSeconds (pneuma-deployments
+# platform/base/platform-secrets-reconcile/cronjob.yaml) — a lease held
+# longer than this pod's own hard deadline can ever legitimately run for
+# is a stuck/dead holder, not a slow-but-alive one, so stealing it after
+# this many seconds is correct rather than merely convenient.
+_LEASE_DURATION_SECONDS = 900
+_LEASE_ACQUIRE_TIMEOUT_SECONDS = 900
+
+
 async def _run(target: str, env: str) -> None:
+    from services.terraformer.src.kube_lease_mutex import KubeLeaseMutex
     from services.terraformer.src.openbao_bootstrap import ensure_platform_auth
     from services.terraformer.src.settings import get_settings
     from services.terraformer.src.terraform_runner import get_runner
@@ -118,10 +129,25 @@ async def _run(target: str, env: str) -> None:
     action = await ensure_platform_auth(settings, get_runner())
     _LOG.info("reconcile_cli openbao auth bootstrap complete: action=%s", action)
 
-    if target in ("platform-secrets", "all"):
-        await _reconcile_platform_secrets(env)
-    if target in ("platform-resources", "all"):
-        await _reconcile_platform_resources(env)
+    # Single-flight mutex — NOT a Terraform-CLI-bypassing infra mutation
+    # (see this repo's CLAUDE.md "NEVER mutate infra by any path OTHER
+    # than the terraform CLI"): a Lease is orchestration/coordination
+    # state for THIS automation, the same category of object kubelet's
+    # own leader-election uses, never a provisioned platform/tenant
+    # resource. It exists because reconcile_cli runs from THREE
+    # independent, unsynchronised triggers (the CronJob's own schedule,
+    # plus two on-merge ad-hoc `kubectl create job` triggers, one per
+    # source repo) that can land in the same apply window — see
+    # kube_lease_mutex.py's module docstring for the full rationale.
+    async with KubeLeaseMutex(
+        _LEASE_NAME,
+        lease_duration_seconds=_LEASE_DURATION_SECONDS,
+        acquire_timeout_seconds=_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+    ):
+        if target in ("platform-secrets", "all"):
+            await _reconcile_platform_secrets(env)
+        if target in ("platform-resources", "all"):
+            await _reconcile_platform_resources(env)
 
 
 def main(argv: list[str] | None = None) -> int:
