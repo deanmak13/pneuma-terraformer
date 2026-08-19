@@ -1508,6 +1508,31 @@ class TerraformRunner:
         return {"exists": True, "outputs": outputs, "bootstrapped": True}
 
 
+    def _ensure_workspace_modules_link(self) -> None:
+        """Every standalone harness's root module references its module as
+        `source = "../../modules/<name>"` — correct in the pneuma-deployments
+        checkout layout, but the runner copies only the harness's top-level
+        FILES into `<workdir_root>/_<harness>/<env>/`, so from there
+        `../../modules` resolves to `<workdir_root>/modules`, which never
+        existed (live incident 2026-08-19: every platform-secrets reconcile
+        died at init with "Unreadable module directory"). One symlink
+        `<workdir_root>/modules -> terraform_modules_root` (the modules tree
+        baked into the image) makes the relative source resolve for every
+        harness workspace at once, without forking harness main.tf between
+        operator-checkout and in-pod layouts."""
+        root = self._settings.terraform_workdir_root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        link = root / "modules"
+        target = self._settings.terraform_modules_root.resolve()
+        if link.is_symlink():
+            if link.resolve() == target:
+                return
+            link.unlink()
+        elif link.exists():
+            # A real directory here is operator-placed — leave it alone.
+            return
+        link.symlink_to(target, target_is_directory=True)
+
     # --- Platform-secrets reconcile (provisioning.apply_platform_secrets) ---
     def _platform_secrets_workdir(self, env: str) -> Path:
         """Single env-scoped workspace per cluster — distinct from
@@ -1554,6 +1579,7 @@ class TerraformRunner:
     async def _ensure_platform_workspace(self, env: str) -> Path:
         workdir = self._platform_secrets_workdir(env)
         workdir.mkdir(parents=True, exist_ok=True)
+        self._ensure_workspace_modules_link()
         source = self._platform_secrets_source()
         if not source.exists():
             raise TerraformError(
@@ -1708,6 +1734,7 @@ class TerraformRunner:
     async def _ensure_platform_resources_workspace(self, env: str) -> Path:
         workdir = self._platform_resources_workdir(env)
         workdir.mkdir(parents=True, exist_ok=True)
+        self._ensure_workspace_modules_link()
         source = self._platform_resources_source()
         if not source.exists():
             raise TerraformError(
@@ -1847,6 +1874,7 @@ class TerraformRunner:
     async def _ensure_platform_bus_topology_workspace(self, env: str) -> Path:
         workdir = self._platform_bus_topology_workdir(env)
         workdir.mkdir(parents=True, exist_ok=True)
+        self._ensure_workspace_modules_link()
         source = self._platform_bus_topology_source()
         if not source.exists():
             raise TerraformError(
