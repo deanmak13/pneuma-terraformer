@@ -431,6 +431,97 @@ class PlatformResourcesInputs:
 
 
 @dataclass(frozen=True)
+class _PlatformResourcesImportEntry:
+    name: str
+    resource_address: str
+    resource_id: str
+
+
+# Mirrors pneuma-deployments infrastructure/terraform/modules/platform-
+# resources/inter-service-hmac.tf's `local.inter_service_hmac_pairs` KEYS
+# exactly — that .tf file's own header comment already documents this
+# "kept in sync by inspection at PR time" convention against
+# services/common/rpc/service_pairs.py (pneuma-engine); this is the SAME
+# convention one level removed. Verified against pneuma-deployments
+# origin/main at authoring time (2026-08-19).
+_INTER_SERVICE_HMAC_PAIRS: tuple[str, ...] = (
+    "brain-brain",
+    "connector-gateway-agno",
+    "connector-gateway-connector-gateway",
+    "cycle-executor-brain",
+    "cycle-executor-connector-gateway",
+    "harness-api-mimesis",
+    "brain-brain-api",
+    "brain-cycle-api",
+    "connector-gateway-brain-api",
+    "conversation-api-brain-api",
+    "cycle-executor-brain-api",
+    "mimesis-api-brain-api",
+    "tenant-api-brain",
+    "connector-api-connector-gateway",
+    "mimesis-connector-gateway",
+    "tenant-api-connector-gateway",
+    "brain-connector-gateway",
+    "platform-api-connector-gateway",
+    "portal-brain-api",
+    "mimesis-tenant-api",
+)
+
+
+def _platform_resources_import_entries(env: str) -> tuple[_PlatformResourcesImportEntry, ...]:
+    """Registry for `_import_preexisting_platform_resources` — same
+    design as `_IMPORT_ON_EXISTS_RESOURCES` (LAW: design for N, never for
+    1), for the platform-resources workspace. `env` is accepted (not
+    currently used in any ID) for symmetry with the tenant registry's
+    per-input callables and because a future entry may need it (this
+    workspace IS env-scoped, unlike the tenant one which is per-tenant).
+    """
+    entries = [
+        _PlatformResourcesImportEntry(
+            name="activepieces_app_role",
+            resource_address="postgresql_role.activepieces_app",
+            # Mirrors modules/platform-resources's `var.activepieces_
+            # role_name` default ("activepieces_app") — the standalone
+            # harness never overrides it. cyrilgdn/postgresql provider: a
+            # postgresql_role's import ID IS the role name, no composite
+            # prefix (same convention as the tenant registry's
+            # _tenant_app_role_id).
+            resource_id="activepieces_app",
+        ),
+        _PlatformResourcesImportEntry(
+            name="activepieces_database",
+            resource_address="postgresql_database.activepieces",
+            # Mirrors `var.activepieces_database` default ("activepieces").
+            # Same CREATE-ONLY failure class as the role (postgres.tf
+            # documents this module CREATEs the database declaratively —
+            # a partial apply that created it but died before the state
+            # write hits the identical "already exists" class as the role).
+            # cyrilgdn/postgresql provider: a postgresql_database's import
+            # ID IS the database name.
+            resource_id="activepieces",
+        ),
+    ]
+    for pair in _INTER_SERVICE_HMAC_PAIRS:
+        entries.append(
+            _PlatformResourcesImportEntry(
+                name=f"inter_service_hmac_{pair}",
+                resource_address=f'vault_kv_secret_v2.inter_service_hmac["{pair}"]',
+                # hashicorp/vault provider: a vault_kv_secret_v2's import
+                # ID is "<mount>/<path>" (the bare KV-v2 logical path, NOT
+                # the "/data/" HTTP-API form used elsewhere in this file
+                # for `vault_kv_secret_v2` DATA SOURCE reads). Mount is
+                # hardcoded "pneuma" by the standalone harness's
+                # `module "platform_resources" { vault_kv_mount = "pneuma" }`
+                # block (infrastructure/terraform/standalone/platform-
+                # resources-apply/main.tf) — the same singular platform
+                # mount every other workspace on this runner uses.
+                resource_id=f"pneuma/infra/inter-service-hmac/{pair}",
+            )
+        )
+    return tuple(entries)
+
+
+@dataclass(frozen=True)
 class PlatformBusTopologyInputs:
     """Inputs to the platform-bus-topology reconcile harness.
 
@@ -1776,6 +1867,60 @@ class TerraformRunner:
         path.write_text(json.dumps(self._platform_resources_tfvars(inputs)))
         return path
 
+    async def _import_preexisting_platform_resources(self, workdir: Path, env: str) -> None:
+        """Platform-resources sibling of `_import_preexisting_resources`
+        (see `_IMPORT_ON_EXISTS_RESOURCES` above for the full design
+        rationale — LAW: design for N, never for 1). Same best-effort
+        import-before-apply convergence, extended to the
+        platform-resources workspace's CREATE-ONLY resources:
+
+          pq: role "activepieces_app" already exists (42710)  -- postgres.tf
+          Vault check-and-set on infra/inter-service-hmac/<pair> -- inter-service-hmac.tf
+
+        (2026-08-19 defect: a `platform-resources/<env>.tfstate` apply
+        killed/retried mid-run left `activepieces_app` created against the
+        real Postgres server but absent from state — every re-apply then
+        fatally errored on CREATE ROLE instead of converging. Partial
+        applies are also now in play for the HMAC pair KV secrets, so
+        those are registered too — see `_platform_resources_import_
+        entries`.)
+
+        Threads `_platform_resources_extra_env()` (TF_VAR_pg_host/
+        pg_port/pg_superuser_password) into every import attempt — unlike
+        the tenant module (no provider{} blocks, credentials arrive via
+        `_provider_env()` alone), this workspace's postgresql provider IS
+        explicitly configured from those TF_VAR_* vars (see the
+        standalone harness's `provider "postgresql" { host = var.pg_host
+        ... }`). Without them here, EVERY postgresql_role/postgresql_
+        database import would fail on a connection/auth error rather than
+        a genuine "does not exist" — silently defeating this fix for
+        exactly the two resources it exists to cover.
+        """
+        existing = await self._state_addresses(workdir)
+        extra_env = self._platform_resources_extra_env()
+        for entry in _platform_resources_import_entries(env):
+            if entry.resource_address in existing:
+                continue
+            result = await self._spawn_once(
+                workdir,
+                ["import", "-input=false", entry.resource_address, entry.resource_id],
+                timeout=60,
+                extra_env=extra_env,
+                failure_expected=True,
+            )
+            if result.exit_code == 0:
+                _LOG.warning(
+                    "tf import: adopted pre-existing %s (%s=%s) into state for "
+                    "platform-resources env=%s — re-apply drift recovery",
+                    entry.name, entry.resource_address, entry.resource_id, env,
+                )
+            else:
+                _LOG.debug(
+                    "tf import: %s (%s=%s) not found for platform-resources env=%s "
+                    "— apply will create it",
+                    entry.name, entry.resource_address, entry.resource_id, env,
+                )
+
     async def reconcile_platform_resources(
         self, inputs: "PlatformResourcesInputs"
     ) -> TerraformResult:
@@ -1801,6 +1946,7 @@ class TerraformRunner:
             await self._init_platform_resources(workdir, env)
             await self._platform_resources_tfvars_file(workdir, inputs)
             extra_env = self._platform_resources_extra_env()
+            await self._import_preexisting_platform_resources(workdir, env)
             try:
                 result = await self._spawn(
                     workdir,

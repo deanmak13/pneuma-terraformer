@@ -17,6 +17,7 @@ from services.terraformer.src import terraform_runner as runner_mod
 from services.terraformer.src.settings import Settings, get_settings
 from services.terraformer.src.terraform_runner import (
     PlatformBusTopologyInputs,
+    PlatformResourcesInputs,
     PlatformSecretsInputs,
     TenantInputs,
     TerraformError,
@@ -3609,3 +3610,163 @@ async def test_reconcile_serializes_two_runner_instances_via_tenant_lease(
     assert order.index("b-start") > order.index("a-end"), (
         "the second runner must only start AFTER the first released the lease"
     )
+
+
+# ---------------------------------------------------------------------------
+# Platform-resources import-on-exists (2026-08-19 defect): platform-
+# resources/<env>.tfstate applies wedge permanently on
+# `pq: role "activepieces_app" already exists (42710)` when a prior
+# apply created the role but died before the state write — mirrors the
+# tenant registry's design exactly (see _IMPORT_ON_EXISTS_RESOURCES /
+# _import_preexisting_resources above), extended to this workspace's
+# CREATE-ONLY resources (the AP role, the AP database, and every
+# inter-service-HMAC pair KV secret).
+
+def test_platform_resources_import_entries_cover_role_and_database() -> None:
+    entries = runner_mod._platform_resources_import_entries("tst")
+    by_address = {e.resource_address: e.resource_id for e in entries}
+    assert by_address["postgresql_role.activepieces_app"] == "activepieces_app"
+    assert by_address["postgresql_database.activepieces"] == "activepieces"
+
+
+def test_platform_resources_import_entries_cover_every_hmac_pair() -> None:
+    entries = runner_mod._platform_resources_import_entries("tst")
+    addresses = {e.resource_address for e in entries}
+    for pair in runner_mod._INTER_SERVICE_HMAC_PAIRS:
+        assert f'vault_kv_secret_v2.inter_service_hmac["{pair}"]' in addresses
+    # One row generates N addresses (design-for-N) — not a hardcoded
+    # one-off for the single role the live incident hit.
+    assert len(addresses) == 2 + len(runner_mod._INTER_SERVICE_HMAC_PAIRS)
+
+
+def test_platform_resources_hmac_import_id_matches_vault_kv_convention() -> None:
+    entries = runner_mod._platform_resources_import_entries("tst")
+    entry = next(
+        e for e in entries
+        if e.resource_address == 'vault_kv_secret_v2.inter_service_hmac["brain-brain"]'
+    )
+    assert entry.resource_id == "pneuma/infra/inter-service-hmac/brain-brain"
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_platform_resources_skips_when_already_in_state(
+    tmp_path: Path,
+) -> None:
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    all_addresses = "\n".join(
+        e.resource_address for e in runner_mod._platform_resources_import_entries("tst")
+    )
+    calls: list[list[str]] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        calls.append(args)
+        if args == ["state", "list"]:
+            return TerraformResult(exit_code=0, stdout=all_addresses + "\n", stderr="", outputs={})
+        raise AssertionError("import must not run when every resource is already in state")
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)), \
+         patch.object(runner, "_platform_resources_extra_env", lambda: {}):
+        await runner._import_preexisting_platform_resources(workdir, "tst")
+
+    assert calls == [["state", "list"]]
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_platform_resources_adopts_pre_existing_role(
+    tmp_path: Path,
+) -> None:
+    """The live defect: `activepieces_app` created by a prior partial
+    apply but never recorded in state must be imported with the exact ID
+    the module itself would compute (the role name)."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    imported: list[list[str]] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="No instances", outputs={})
+        assert args[0] == "import"
+        # extra_env must be threaded through so the postgresql provider
+        # can actually authenticate the import call.
+        assert kwargs.get("extra_env") == {"TF_VAR_pg_host": "stub"}
+        imported.append(args)
+        return TerraformResult(exit_code=0, stdout="Import successful!", stderr="", outputs={})
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)), \
+         patch.object(
+             runner, "_platform_resources_extra_env", lambda: {"TF_VAR_pg_host": "stub"}
+         ):
+        await runner._import_preexisting_platform_resources(workdir, "tst")
+
+    role_imports = [a for a in imported if a[-2] == "postgresql_role.activepieces_app"]
+    assert role_imports == [
+        ["import", "-input=false", "postgresql_role.activepieces_app", "activepieces_app"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_platform_resources_swallows_not_found(
+    tmp_path: Path,
+) -> None:
+    """A fresh cluster (nothing pre-exists): every import attempt fails
+    and must NOT raise — the subsequent `apply` creates everything fresh,
+    exactly as before this fix."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        return TerraformResult(
+            exit_code=1, stdout="", stderr="Cannot import non-existent object", outputs={},
+        )
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)), \
+         patch.object(runner, "_platform_resources_extra_env", lambda: {}):
+        # Must not raise.
+        await runner._import_preexisting_platform_resources(workdir, "tst")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_platform_resources_attempts_import_before_apply(
+    tmp_path: Path,
+) -> None:
+    """Wiring check: reconcile_platform_resources() must run the
+    import-on-exists step before dispatching `apply`, mirroring
+    test_reconcile_attempts_import_before_apply for the tenant path."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    standalone_src = settings.terraform_standalone_root / "platform-resources-apply"
+    standalone_src.mkdir(parents=True)
+    (standalone_src / "main.tf").write_text("# stub\n")
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    called = {"import": False}
+
+    async def _fake_import(workdir, env):  # noqa: ARG001
+        called["import"] = True
+
+    ok = TerraformResult(exit_code=0, stdout="{}", stderr="", outputs={})
+
+    with patch.object(
+        runner, "_import_preexisting_platform_resources", AsyncMock(side_effect=_fake_import)
+    ), patch.object(runner, "_spawn", AsyncMock(return_value=ok)), \
+       patch.object(runner, "_output_json", AsyncMock(return_value={})), \
+       patch.object(runner, "_platform_resources_extra_env", lambda: {}):
+        await runner.reconcile_platform_resources(PlatformResourcesInputs(env="tst"))
+
+    assert called["import"] is True
