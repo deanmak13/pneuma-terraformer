@@ -64,9 +64,14 @@ env:
   # are baked into this image, so the fix is inert until this ref moves.
   DEPLOYMENTS_REF: 541b18e3b440963909389aadac6912596720a845
 
+# An image is an artifact OF a commit — two commits are two images and
+# neither supersedes the other; deployments pin sha-<40>. ref-keyed
+# cancel-in-progress:true meant every rapid merge to main cancelled the
+# prior in-flight build outright (the pattern pneuma-engine's
+# build-and-publish.yml #422/#1846 fixed for the same reason).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   build-and-push:
