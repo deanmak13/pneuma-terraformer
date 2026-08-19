@@ -790,6 +790,39 @@ async def test_ensure_platform_secrets_workspace_writes_vault_provider_file(
 
 
 @pytest.mark.asyncio
+async def test_platform_workspaces_get_modules_symlink(tmp_path: Path) -> None:
+    """Every standalone harness references `source = "../../modules/<name>"`,
+    which from `<workdir_root>/_<harness>/<env>/` resolves to
+    `<workdir_root>/modules` — the runner must materialize that as a symlink
+    to the baked-in modules tree or every platform reconcile dies at init
+    with "Unreadable module directory" (live incident 2026-08-19)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    settings.terraform_modules_root.mkdir(parents=True)
+    standalone_src = settings.terraform_standalone_root / "platform-secrets-apply"
+    standalone_src.mkdir(parents=True)
+    (standalone_src / "main.tf").write_text("# stub\n")
+    runner = TerraformRunner(settings)
+
+    workdir = await runner._ensure_platform_workspace("tst")
+
+    link = settings.terraform_workdir_root / "modules"
+    assert link.is_symlink()
+    assert link.resolve() == settings.terraform_modules_root.resolve()
+    # the harness's relative source now resolves from inside the workspace
+    assert (workdir / ".." / ".." / "modules").resolve() == (
+        settings.terraform_modules_root.resolve()
+    )
+    # idempotent — second ensure leaves a valid link in place
+    await runner._ensure_platform_workspace("tst")
+    assert link.is_symlink()
+
+
+@pytest.mark.asyncio
 async def test_ensure_platform_bus_topology_workspace_has_no_vault_provider_file(
     tmp_path: Path,
 ) -> None:
