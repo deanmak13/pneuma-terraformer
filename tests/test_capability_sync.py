@@ -13,6 +13,8 @@ typed client, not a raw httpx.AsyncClient at the call site (ORM-only LAW
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -112,6 +114,28 @@ def test_capability_rows_authority_is_operator_only_for_every_row() -> None:
     authority=operator_only per the proto annotations."""
     for row in _rows():
         assert row["authority"] == "operator_only"
+
+
+def test_capability_rows_applies_timeout_override_for_apply_tenant_resources() -> None:
+    """`provisioning.apply_tenant_resources` gets the 180s override — this
+    module is the ONLY writer of that row's `public.capabilities` entry (no
+    pneuma-engine service walks this proto's descriptor), so the row must
+    carry the correct value directly rather than relying on the schema
+    default. Regression test: prior to this fix, `timeout_seconds` was never
+    set at all here, so the row silently sat at the schema's `NOT NULL
+    DEFAULT 30` forever — reconcile attempts hit DEADLINE_EXCEEDED and
+    Temporal retried indefinitely (the SLO-breach root cause)."""
+    by_name = {row["name"]: row for row in _rows()}
+    assert by_name["provisioning.apply_tenant_resources"]["timeout_seconds"] == 180
+
+
+def test_capability_rows_leaves_unmapped_provisioning_rpcs_at_schema_default() -> None:
+    """Every other provisioning.* row keeps the schema's 30s default —
+    the override is scoped to the one measured-slow capability, not a
+    blanket change."""
+    by_name = {row["name"]: row for row in _rows()}
+    assert by_name["provisioning.destroy_tenant_resources"]["timeout_seconds"] == 30
+    assert by_name["provisioning.read_tenant_state"]["timeout_seconds"] == 30
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +238,65 @@ async def test_sync_provisioning_capabilities_updates_when_present() -> None:
 
     assert result == {"inserted": 0, "updated": 3, "total": 3}
     assert update_route.call_count == 3
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_sync_provisioning_capabilities_insert_payload_carries_override() -> None:
+    """First-ever boot (no existing row) — the INSERT payload must carry
+    timeout_seconds=180 for provisioning.apply_tenant_resources directly, not
+    rely on a later UPDATE to correct it."""
+    respx.get(f"{_BASE_URL}/capabilities").mock(return_value=httpx.Response(200, json=[]))
+    insert_route = respx.post(f"{_BASE_URL}/capabilities").mock(
+        return_value=httpx.Response(201, json=[])
+    )
+
+    await sync_provisioning_capabilities(
+        base_url=_BASE_URL,
+        service_key="svc-key",
+        file_descriptors=[provisioning_api_pb2.DESCRIPTOR],
+        grpc_target=_GRPC_TARGET,
+    )
+
+    bodies = [
+        json.loads(call.request.content)
+        for call in insert_route.calls
+    ]
+    by_name = {b["name"]: b for b in bodies}
+    assert by_name["provisioning.apply_tenant_resources"]["timeout_seconds"] == 180
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_sync_provisioning_capabilities_update_payload_reasserts_override() -> None:
+    """A later reconcile (row already exists, e.g. pod restart after an
+    out-of-band write left it at 30) — the UPDATE (PATCH) payload must
+    re-assert timeout_seconds=180 rather than omitting the key, so the row
+    is deterministically 180 regardless of write order relative to any
+    other process touching this row."""
+    existing = [
+        {"id": "id-1", "name": "provisioning.apply_tenant_resources", "owning_tenant_id": None},
+        {"id": "id-2", "name": "provisioning.destroy_tenant_resources", "owning_tenant_id": None},
+        {"id": "id-3", "name": "provisioning.read_tenant_state", "owning_tenant_id": None},
+    ]
+    respx.get(f"{_BASE_URL}/capabilities").mock(return_value=httpx.Response(200, json=existing))
+    update_route = respx.patch(f"{_BASE_URL}/capabilities").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    await sync_provisioning_capabilities(
+        base_url=_BASE_URL,
+        service_key="svc-key",
+        file_descriptors=[provisioning_api_pb2.DESCRIPTOR],
+        grpc_target=_GRPC_TARGET,
+    )
+
+    bodies = [
+        json.loads(call.request.content)
+        for call in update_route.calls
+    ]
+    by_name = {b["name"]: b for b in bodies}
+    assert by_name["provisioning.apply_tenant_resources"]["timeout_seconds"] == 180
 
 
 @pytest.mark.asyncio

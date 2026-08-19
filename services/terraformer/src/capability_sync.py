@@ -17,6 +17,28 @@ _ALLOWED_EFFECTS = {
     "perform_external_action",
 }
 
+# MIRROR of pneuma-engine's `services/common/proto_capability_sync.py`
+# `TIMEOUT_SECONDS_OVERRIDES` — kept in sync by hand because tf-runner has no
+# import path into that repo (this service depends only on the shared
+# `pneuma_proto` wheel, not on pneuma-engine's `services.common` package).
+#
+# `provisioning.apply_tenant_resources` (RunTenantReconcile, host_service
+# "tf-runner") is registered EXCLUSIVELY by this module — no pneuma-engine
+# service ever walks provisioning_api.proto's descriptor, so pneuma-engine's
+# copy of this override never actually fires for this capability. This
+# module is that row's ONLY writer; previously it never set `timeout_seconds`
+# at all, so the row silently sat at the `public.capabilities` schema's
+# `NOT NULL DEFAULT 30` forever — reproducing, permanently, the exact
+# DEADLINE_EXCEEDED-retries-forever failure pneuma-engine#1868 believed it
+# had fixed. RunTenantReconcile measured 45-55s per tenant (terraformer
+# process-spawn logs, QA round 6, 2026-08-18); 180s is >=3x that worst case.
+# Add an entry here (and mirror it in pneuma-engine's map, with a comment
+# cross-referencing both files) only when a capability's real-world duration
+# is measured to exceed the schema's 30s default.
+_TIMEOUT_SECONDS_OVERRIDES: dict[str, int] = {
+    "provisioning.apply_tenant_resources": 180,
+}
+
 
 def _risk_category(effect: str) -> str:
     if effect == "read_only":
@@ -152,6 +174,13 @@ def _capability_rows(file_descriptors: list[Any], grpc_target: str) -> list[dict
                         "capability_class": "platform_internal",
                         "health_status": "healthy",
                         "provider_schema": {},
+                        # Always written explicitly (never omitted) so every
+                        # sync run — insert or update, in any boot order
+                        # relative to pneuma-engine's own sync — reasserts
+                        # the correct value instead of silently falling back
+                        # to the schema's NOT NULL DEFAULT 30 on first
+                        # INSERT and never being corrected afterward.
+                        "timeout_seconds": _TIMEOUT_SECONDS_OVERRIDES.get(name, 30),
                     }
                 )
     return rows
