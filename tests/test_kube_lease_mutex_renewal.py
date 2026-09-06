@@ -256,22 +256,45 @@ async def test_renewal_stops_when_the_lease_object_is_deleted(
     assert "tf-tenant-t-006" not in fake_api.leases, "renewal must not resurrect it"
 
 
-@pytest.mark.asyncio
-async def test_renewal_treats_a_write_conflict_as_still_held(
-    fake_api: _FakeLeasesApi, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A 409 on the renewal PUT (resourceVersion conflict) is not
-    evidence of loss — the next tick re-reads and decides."""
+def _conflict_once(
+    fake_api: _FakeLeasesApi,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    thief: str | None = None,
+    deleted: bool = False,
+) -> dict[str, int]:
+    """Make the next renewal PUT fail with 409. With `thief`, the
+    conflicting write that caused the 409 is a steal: the fake store's
+    holder flips to `thief` at the moment the 409 is returned — exactly
+    what a waiter's PUT racing our renewal looks like from our side.
+    With `deleted`, the competing write removed the object outright."""
     real_handler = fake_api.handler
-    conflicts = {"left": 1}
+    conflicts = {"left": 1, "puts_after": 0}
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "PUT" and conflicts["left"] > 0:
-            conflicts["left"] -= 1
-            return httpx.Response(409, json={"message": "conflict"})
+        if request.method == "PUT":
+            if conflicts["left"] > 0:
+                conflicts["left"] -= 1
+                name = request.url.path.rsplit("/", 1)[-1]
+                if thief is not None:
+                    fake_api.leases[name]["spec"]["holderIdentity"] = thief
+                if deleted:
+                    del fake_api.leases[name]
+                return httpx.Response(409, json={"message": "conflict"})
+            conflicts["puts_after"] += 1
         return real_handler(request)
 
     monkeypatch.setattr(fake_api, "handler", _handler)
+    return conflicts
+
+
+@pytest.mark.asyncio
+async def test_write_conflict_with_the_lease_still_ours_keeps_renewing(
+    fake_api: _FakeLeasesApi, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 409 on the renewal PUT whose re-read still shows us as holder
+    is not evidence of loss — renewal carries on."""
+    conflicts = _conflict_once(fake_api, monkeypatch)
     mutex = KubeLeaseMutex(
         "tf-tenant-t-007",
         lease_duration_seconds=1,
@@ -281,11 +304,68 @@ async def test_renewal_treats_a_write_conflict_as_still_held(
     async with mutex:
         acquired_at = _parse_rfc3339(fake_api.spec("tf-tenant-t-007")["renewTime"])
         assert acquired_at is not None
-        await _wait_until(lambda: fake_api.put_count >= 3)
+        await _wait_until(lambda: conflicts["puts_after"] >= 2)
         assert conflicts["left"] == 0
         assert mutex._renew_task is not None and not mutex._renew_task.done()
         renewed = _parse_rfc3339(fake_api.spec("tf-tenant-t-007")["renewTime"])
         assert renewed is not None and renewed > acquired_at
+
+
+@pytest.mark.asyncio
+async def test_write_conflict_caused_by_a_steal_is_reported_as_lost(
+    fake_api: _FakeLeasesApi, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The only other writer of a tenant lease is a waiter stealing it
+    after expiry, so a 409 must be answered from a fresh read of the
+    holder — never assumed to be 'still ours'."""
+    _conflict_once(fake_api, monkeypatch, thief="thief-pod-1")
+    mutex = KubeLeaseMutex(
+        "tf-tenant-t-008",
+        lease_duration_seconds=1,
+        acquire_timeout_seconds=1,
+    )
+    await mutex.acquire()
+    async with mutex._client() as client:
+        assert await mutex._renew_once(client) is False
+    assert fake_api.spec("tf-tenant-t-008")["holderIdentity"] == "thief-pod-1"
+
+
+@pytest.mark.asyncio
+async def test_write_conflict_whose_competing_write_deleted_the_lease_is_lost(
+    fake_api: _FakeLeasesApi, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _conflict_once(fake_api, monkeypatch, deleted=True)
+    mutex = KubeLeaseMutex(
+        "tf-tenant-t-010",
+        lease_duration_seconds=1,
+        acquire_timeout_seconds=1,
+    )
+    await mutex.acquire()
+    async with mutex._client() as client:
+        assert await mutex._renew_once(client) is False
+    assert "tf-tenant-t-010" not in fake_api.leases
+
+
+@pytest.mark.asyncio
+async def test_renew_loop_stops_on_a_steal_conflict_and_never_clobbers(
+    fake_api: _FakeLeasesApi, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conflicts = _conflict_once(fake_api, monkeypatch, thief="thief-pod-2")
+    mutex = KubeLeaseMutex(
+        "tf-tenant-t-009",
+        lease_duration_seconds=1,
+        renew_interval_seconds=0.05,
+        acquire_timeout_seconds=1,
+    )
+    async with mutex:
+        renew_task = mutex._renew_task
+        assert renew_task is not None
+        await _wait_until(lambda: renew_task.done())
+        assert not renew_task.cancelled()
+        assert conflicts["left"] == 0
+    # Neither the stopped renewer nor release() wrote over the thief.
+    assert conflicts["puts_after"] == 0
+    assert fake_api.spec("tf-tenant-t-009")["holderIdentity"] == "thief-pod-2"
 
 
 @pytest.mark.asyncio

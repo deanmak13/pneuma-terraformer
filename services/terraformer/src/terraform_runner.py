@@ -710,6 +710,10 @@ class TerraformRunner:
         # every apply, burning the whole ~590s RunTenantReconcile budget
         # on queueing before apply ever started.
         self._read_sem: asyncio.Semaphore | None = None
+        # Single-flight gate for `terraform init` — the only command that
+        # WRITES the shared TF_PLUGIN_CACHE_DIR (see _init_gate). Lazily
+        # created like the semaphores above.
+        self._init_lock: asyncio.Lock | None = None
 
     def _lock_for(self, tenant_id: str) -> asyncio.Lock:
         if tenant_id not in self._locks:
@@ -801,6 +805,28 @@ class TerraformRunner:
                 self._settings.max_concurrent_terraform_runs * self._READ_SEMAPHORE_MULTIPLIER
             )
         return self._read_sem
+
+    def _init_gate(self) -> asyncio.Lock:
+        """Process-wide single-flight gate for `terraform init`, held by
+        `_spawn` for the subprocess's whole lifetime whenever the command
+        is `init` — regardless of which of the init call sites (tenant,
+        standalone, platform harnesses) spawned it.
+
+        Terraform documents TF_PLUGIN_CACHE_DIR as NOT concurrency-safe:
+        "behavior in environments with multiple terraform init calls is
+        undefined" (hashicorp/terraform#31964, #33497) — two inits that
+        both miss the cache unpack the same provider into it at once,
+        and the loser can leave a half-written package that every later
+        init then symlinks to. The heavy semaphore admits
+        `max_concurrent_terraform_runs` (default 2) spawns, so two
+        tenants' inits DO overlap without this. Only `init` touches the
+        cache — apply/plan/output/state read the symlinks init left in
+        the workspace — so serialising init alone keeps every other
+        command's concurrency intact. Lazily created for the same reason
+        as `_spawn_semaphore`."""
+        if self._init_lock is None:
+            self._init_lock = asyncio.Lock()
+        return self._init_lock
 
     def _spawn_queue_budget(self, timeout: float) -> int:
         """Seconds a given `_spawn` call may wait to ACQUIRE a concurrency
@@ -1118,6 +1144,11 @@ class TerraformRunner:
         # exactly once, including on cancellation (asyncio.CancelledError
         # is a BaseException, not caught by any `except` clause here, so
         # only a `finally` reliably runs on it).
+        #
+        # `init` additionally holds the single-flight init gate (see
+        # _init_gate) — set only once actually acquired, so the same
+        # `finally` releases it exactly on the branch that took it.
+        held_init_gate: asyncio.Lock | None = None
         try:
             _queued_s = time.monotonic() - _t0
             if _queued_s > 1.0:
@@ -1154,6 +1185,38 @@ class TerraformRunner:
                     ),
                     outputs={},
                 )
+
+            # Single-flight `terraform init` — the only command that
+            # writes the shared plugin cache, which Terraform documents
+            # as unsafe under concurrent inits (see _init_gate). Taken
+            # INSIDE the concurrency permit so the process cap above
+            # still bounds everything; bounded by what is left of this
+            # call's own budget, and that budget is re-derived afterwards
+            # so the subprocess never gets more than the caller allowed.
+            if args[0] == "init":
+                init_gate = self._init_gate()
+                if init_gate.locked():
+                    _LOG.info(
+                        "tf init queued behind another init (shared plugin cache): "
+                        "workdir=%s",
+                        workdir,
+                    )
+                try:
+                    await asyncio.wait_for(init_gate.acquire(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return TerraformResult(
+                        exit_code=124,
+                        stdout="",
+                        stderr=(
+                            f"terraform init queued too long behind another "
+                            f"terraform init (waited >{remaining:.1f}s of the "
+                            f"{timeout}s budget)"
+                        ),
+                        outputs={},
+                    )
+                held_init_gate = init_gate
+                _queued_s = time.monotonic() - _t0
+                remaining = self._effective_run_timeout(timeout, _queued_s)
 
             # Logged AFTER acquisition (and the refuse-to-start check
             # above) so this line reliably means "a process actually
@@ -1237,6 +1300,8 @@ class TerraformRunner:
                 outputs={},
             )
         finally:
+            if held_init_gate is not None:
+                held_init_gate.release()
             sem.release()
 
     def _vault_provider_hcl(self) -> str:

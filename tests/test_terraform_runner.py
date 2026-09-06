@@ -1684,6 +1684,120 @@ async def test_spawn_respects_concurrency_limit(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_spawn_single_flights_terraform_init_for_the_shared_plugin_cache(
+    tmp_path: Path,
+) -> None:
+    """Terraform documents TF_PLUGIN_CACHE_DIR as undefined under
+    concurrent `init` (hashicorp/terraform#31964): with the shared cache
+    from the 2026-09-06 eviction fix, two tenants' inits admitted by the
+    limit=2 semaphore would race unpacking the same provider. `init` must
+    therefore run one at a time across the process — while every other
+    command keeps the semaphore's full concurrency (the gate must not
+    quietly halve apply throughput)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdirs = []
+    for i in range(4):
+        wd = settings.terraform_workdir_root / f"ws{i}"
+        wd.mkdir()
+        workdirs.append(wd)
+    runner = TerraformRunner(settings)
+
+    init_state = {"current": 0, "peak": 0}
+    apply_state = {"current": 0, "peak": 0}
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc(init_state if "init" in args else apply_state)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
+        inits = await asyncio.gather(
+            *[runner._spawn(wd, ["init", "-input=false"], timeout=5) for wd in workdirs]
+        )
+        applies = await asyncio.gather(
+            *[runner._spawn(wd, ["apply", "-auto-approve"], timeout=5) for wd in workdirs]
+        )
+
+    assert all(r.exit_code == 0 for r in inits)
+    assert init_state["peak"] == 1, f"{init_state['peak']} inits overlapped on the plugin cache"
+    assert all(r.exit_code == 0 for r in applies)
+    assert apply_state["peak"] == 4, "the init gate must not serialise non-init commands"
+
+
+@pytest.mark.asyncio
+async def test_spawn_releases_init_gate_on_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed init must not leave the single-flight gate held — the next
+    init would otherwise queue until its own budget expired (exit 124)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    async def _raising_exec(*args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("boom: subprocess spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _raising_exec)
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner._spawn(workdir, ["init", "-input=false"], timeout=5)
+    assert not runner._init_gate().locked()
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc({"current": 0, "peak": 0}, hold=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+    second = await asyncio.wait_for(
+        runner._spawn(workdir, ["init", "-input=false"], timeout=5), timeout=1,
+    )
+    assert second.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_init_waiting_on_the_gate_is_bounded_by_its_own_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An init stuck behind a long-running init gives up with exit 124
+    (same contract as the semaphore queue) instead of waiting past the
+    caller's budget — and the process cap's slot it holds is freed."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    gate = runner._init_gate()
+    await gate.acquire()  # stand-in for an init that is still unpacking
+    try:
+        async def _never_exec(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("must not spawn while another init holds the gate")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+        result = await runner._spawn(workdir, ["init", "-input=false"], timeout=1.2)
+    finally:
+        gate.release()
+
+    assert result.exit_code == 124
+    assert "behind another terraform init" in result.stderr
+    assert not runner._spawn_semaphore().locked()
+
+
+@pytest.mark.asyncio
 async def test_spawn_releases_semaphore_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

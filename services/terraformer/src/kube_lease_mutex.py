@@ -298,10 +298,19 @@ class KubeLeaseMutex:
         lease["spec"] = spec
         update_resp = await client.put(f"{base}/{self.name}", json=lease)
         if update_resp.status_code == 409:
-            # resourceVersion conflict — someone touched the object
-            # between our GET and PUT. Treat as still-ours for this tick;
-            # the next tick re-reads and decides.
-            return True
+            # resourceVersion conflict — someone wrote the object between
+            # our GET and PUT. The only other writer of this lease is a
+            # waiter stealing it after seeing it expired, so a conflict
+            # most plausibly means we just LOST it. Re-read now and answer
+            # from the holder actually on the object — assuming "still
+            # ours" would be one more renewal of a lease we no longer own,
+            # i.e. an unwarranted "still held" signal for a full tick.
+            recheck = await client.get(f"{base}/{self.name}")
+            if recheck.status_code == 404:
+                return False
+            recheck.raise_for_status()
+            current = recheck.json().get("spec", {}) or {}
+            return bool(current.get("holderIdentity") == self.holder)
         update_resp.raise_for_status()
         return True
 
