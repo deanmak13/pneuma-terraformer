@@ -241,3 +241,32 @@ def test_openbao_unseal_key_count_rejects_non_positive(
     monkeypatch.setenv("OPENBAO_UNSEAL_KEY_COUNT", "0")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_plugin_cache_dir_defaults_inside_the_workspace_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache must live in the one volume both the pod and the
+    reconcile CronJob mount writable (root filesystem is read-only), as a
+    dot-prefixed sibling no UUID-named tenant workspace can collide with."""
+    from pathlib import Path
+
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv("TERRAFORM_WORKDIR_ROOT", "/var/lib/terraformer/workspaces")
+    s = Settings()
+    assert s.terraform_plugin_cache_dir is None
+    assert s.computed_plugin_cache_dir == Path(
+        "/var/lib/terraformer/workspaces/.plugin-cache"
+    )
+    assert s.computed_plugin_cache_dir.parent == s.terraform_workdir_root
+
+
+def test_plugin_cache_dir_accepts_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    from services.terraformer.src.settings import Settings
+
+    monkeypatch.setenv("TERRAFORM_PLUGIN_CACHE_DIR", "/mnt/cache/tf")
+    s = Settings()
+    assert s.computed_plugin_cache_dir == Path("/mnt/cache/tf")

@@ -5,7 +5,9 @@ without invoking the real terraform CLI.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -1105,6 +1107,79 @@ async def test_spawn_sets_tf_cli_config_file_and_provider_env(tmp_path: Path) ->
     assert captured_env["PGPASSWORD"] == settings.postgres_superuser_password
 
 
+async def _spawn_capturing_env(runner: TerraformRunner, workdir: Path) -> dict[str, str]:
+    captured_env: dict[str, str] = {}
+    orig_create_subprocess_exec = __import__("asyncio").create_subprocess_exec
+
+    async def _capturing_exec(*args, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        return await orig_create_subprocess_exec(*args, **kwargs)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_capturing_exec):
+        await runner._spawn(workdir, ["--version"], timeout=5)
+    return captured_env
+
+
+@pytest.mark.asyncio
+async def test_spawn_sets_and_creates_shared_plugin_cache_dir(tmp_path: Path) -> None:
+    """Regression for the 2026-08-19 → 2026-09-06 TST eviction series (104
+    `Usage of EmptyDir volume "workspace" exceeds the limit "2Gi"`): every
+    subprocess must carry TF_PLUGIN_CACHE_DIR so provider packages are
+    unpacked once per pod and symlinked into each workspace, and the dir
+    must exist before terraform runs (terraform refuses a missing cache
+    dir) — created by `_spawn` itself, because the reconcile CronJob runs
+    this path from a fresh container with no lifespan hook."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/usr/bin/env",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    expected = settings.terraform_workdir_root / ".plugin-cache"
+    assert not expected.exists()
+
+    captured_env = await _spawn_capturing_env(TerraformRunner(settings), workdir)
+
+    assert captured_env["TF_PLUGIN_CACHE_DIR"] == str(expected)
+    assert expected.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_spawn_honours_explicit_plugin_cache_dir(tmp_path: Path) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/usr/bin/env",
+        terraform_plugin_cache_dir=tmp_path / "elsewhere" / "cache",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+
+    captured_env = await _spawn_capturing_env(TerraformRunner(settings), workdir)
+
+    assert captured_env["TF_PLUGIN_CACHE_DIR"] == str(tmp_path / "elsewhere" / "cache")
+    assert (tmp_path / "elsewhere" / "cache").is_dir()
+
+
+def test_baked_cli_config_lets_the_cache_serve_fresh_workspaces() -> None:
+    """Since Terraform 1.4 a cached provider is only reused when the
+    workspace's .terraform.lock.hcl already vouches for it. Every tenant
+    workspace here is generated fresh (no lock file), so without this
+    setting TF_PLUGIN_CACHE_DIR would be inert and every init would still
+    unpack the full provider set. Asserts on the effective (non-comment)
+    lines of the baked config, not on its prose."""
+    tfrc = Path(__file__).resolve().parents[1] / "tf" / "cli.tfrc"
+    effective = [
+        line.strip()
+        for line in tfrc.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert "plugin_cache_may_break_dependency_lock_file = true" in effective
+
+
 @pytest.mark.asyncio
 async def test_spawn_env_keeps_vault_addr_but_drops_vault_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1608,6 +1683,334 @@ async def test_spawn_respects_concurrency_limit(tmp_path: Path) -> None:
     assert len(results) == 5
     assert all(r.exit_code == 0 for r in results)
     assert state["peak"] <= 2, f"observed peak concurrency {state['peak']} exceeded limit 2"
+
+
+@pytest.mark.asyncio
+async def test_spawn_single_flights_terraform_init_for_the_shared_plugin_cache(
+    tmp_path: Path,
+) -> None:
+    """Terraform documents TF_PLUGIN_CACHE_DIR as undefined under
+    concurrent `init` (hashicorp/terraform#31964): with the shared cache
+    from the 2026-09-06 eviction fix, two tenants' inits admitted by the
+    limit=2 semaphore would race unpacking the same provider. `init` must
+    therefore run one at a time across the process — while every other
+    command keeps the semaphore's full concurrency (the gate must not
+    quietly halve apply throughput)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdirs = []
+    for i in range(4):
+        wd = settings.terraform_workdir_root / f"ws{i}"
+        wd.mkdir()
+        workdirs.append(wd)
+    runner = TerraformRunner(settings)
+
+    init_state = {"current": 0, "peak": 0}
+    apply_state = {"current": 0, "peak": 0}
+
+    async def _fake_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc(init_state if "init" in args else apply_state)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
+        inits = await asyncio.gather(
+            *[runner._spawn(wd, ["init", "-input=false"], timeout=5) for wd in workdirs]
+        )
+        applies = await asyncio.gather(
+            *[runner._spawn(wd, ["apply", "-auto-approve"], timeout=5) for wd in workdirs]
+        )
+
+    assert all(r.exit_code == 0 for r in inits)
+    assert init_state["peak"] == 1, f"{init_state['peak']} inits overlapped on the plugin cache"
+    assert all(r.exit_code == 0 for r in applies)
+    assert apply_state["peak"] == 4, "the init gate must not serialise non-init commands"
+
+
+@pytest.mark.asyncio
+async def test_spawn_releases_init_gate_on_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed init must not leave the single-flight gate held — the next
+    init would otherwise queue until its own budget expired (exit 124)."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    async def _raising_exec(*args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("boom: subprocess spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _raising_exec)
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner._spawn(workdir, ["init", "-input=false"], timeout=5)
+    assert not runner._init_gate().locked()
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc({"current": 0, "peak": 0}, hold=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+    second = await asyncio.wait_for(
+        runner._spawn(workdir, ["init", "-input=false"], timeout=5), timeout=1,
+    )
+    assert second.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_init_waiting_on_the_gate_is_bounded_by_its_own_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An init stuck behind a long-running init gives up with exit 124
+    (same contract as the semaphore queue) instead of waiting past the
+    caller's budget — and the process cap's slot it holds is freed."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    gate = runner._init_gate()
+    await gate.acquire()  # stand-in for an init that is still unpacking
+    try:
+        async def _never_exec(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("must not spawn while another init holds the gate")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+        result = await runner._spawn(workdir, ["init", "-input=false"], timeout=1.2)
+    finally:
+        gate.release()
+
+    assert result.exit_code == 124
+    assert "behind another terraform init" in result.stderr
+    assert not runner._spawn_semaphore().locked()
+
+
+@pytest.mark.asyncio
+async def test_spawn_init_that_queued_on_the_gate_past_the_floor_refuses_to_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refuse-to-start floor (_MIN_RUN_SECONDS_AFTER_QUEUE) is
+    re-applied AFTER the init-gate wait, not only after the permit wait:
+    an init that got the gate with under a second of its budget left
+    must not start and be killed mid-unpack — that is exactly how a
+    half-written provider package lands in the shared cache for every
+    later init to symlink to. Gate held ~0.7s of a 1.5s budget → the
+    0.8s left is under the 1s floor → exit 124, nothing spawned."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    async def _never_exec(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("must not spawn with under a second of budget left")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+
+    gate = runner._init_gate()
+    await gate.acquire()
+
+    async def _release_gate_later() -> None:
+        await asyncio.sleep(0.7)
+        gate.release()
+
+    releaser = asyncio.create_task(_release_gate_later())
+    try:
+        result = await runner._spawn(workdir, ["init", "-input=false"], timeout=1.5)
+    finally:
+        await releaser
+
+    assert result.exit_code == 124
+    assert "refusing to start" in result.stderr
+    assert not gate.locked()
+    assert not runner._spawn_semaphore().locked()
+
+
+@pytest.mark.asyncio
+async def test_spawn_init_is_single_flighted_across_processes_via_the_cache_flock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-process gate cannot see another process's init, and the
+    `terraform_plugin_cache_dir` override lets several processes share
+    one cache. The runner therefore also takes an flock on a file inside
+    the cache dir for the init's lifetime. Here the test IS the other
+    process: it holds that flock on its own fd → an init must give up
+    with exit 124 (bounded by its own budget, gate and permit freed);
+    once released, the same init runs clean and leaves the lock free."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    cache_dir = settings.computed_plugin_cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / ".init.lock"
+    foreign_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(foreign_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        async def _never_exec(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("must not spawn while another process holds the cache lock")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+        blocked = await runner._spawn(workdir, ["init", "-input=false"], timeout=1.2)
+    finally:
+        fcntl.flock(foreign_fd, fcntl.LOCK_UN)
+        os.close(foreign_fd)
+
+    assert blocked.exit_code == 124
+    assert "shared plugin cache" in blocked.stderr
+    assert not runner._init_gate().locked()
+    assert not runner._spawn_semaphore().locked()
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc({"current": 0, "peak": 0}, hold=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+    released = await asyncio.wait_for(
+        runner._spawn(workdir, ["init", "-input=false"], timeout=5), timeout=2,
+    )
+    assert released.exit_code == 0
+
+    # The runner released its flock on exit — a fresh holder gets it at once.
+    probe_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(probe_fd)
+
+
+@pytest.mark.asyncio
+async def test_spawn_init_cancelled_while_polling_the_cache_flock_leaks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gRPC deadline cancels the init while it is still polling for the
+    cache flock: the CancelledError must propagate, and the lock-file fd
+    opened for the poll, the in-process gate and the permit must all be
+    released — the pod would otherwise leak an fd per cancelled init."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    cache_dir = settings.computed_plugin_cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    open_fds_before = len(os.listdir("/proc/self/fd"))
+    foreign_fd = os.open(cache_dir / ".init.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(foreign_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        async def _never_exec(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("must not spawn while another process holds the cache lock")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+        task = asyncio.create_task(
+            runner._spawn(workdir, ["init", "-input=false"], timeout=30),
+        )
+        await asyncio.sleep(0.4)  # well inside the poll loop
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        fcntl.flock(foreign_fd, fcntl.LOCK_UN)
+        os.close(foreign_fd)
+
+    assert len(os.listdir("/proc/self/fd")) == open_fds_before
+    assert not runner._init_gate().locked()
+    assert not runner._spawn_semaphore().locked()
+
+
+@pytest.mark.asyncio
+async def test_spawn_frees_the_gate_and_permit_even_if_the_cache_unlock_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Release steps are isolated from each other: a failure dropping the
+    cache flock must still release the process-wide init gate and the
+    permit — a stranded gate would lock every later init in the pod
+    until it restarts, which is the incident class this PR exists to
+    end. The failure itself still surfaces to the caller."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=1,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc({"current": 0, "peak": 0}, hold=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+
+    def _unlock_raises(fd: int) -> None:
+        os.close(fd)
+        raise OSError("simulated flock/close failure on the cache lock fd")
+
+    original_unlock = TerraformRunner.__dict__["_unlock_plugin_cache"]
+    monkeypatch.setattr(TerraformRunner, "_unlock_plugin_cache", staticmethod(_unlock_raises))
+    with pytest.raises(OSError, match="simulated"):
+        await runner._spawn(workdir, ["init", "-input=false"], timeout=5)
+
+    assert not runner._init_gate().locked()
+    assert not runner._spawn_semaphore().locked()
+
+    # And the single permit is genuinely usable again — not just unlocked-looking.
+    monkeypatch.setattr(TerraformRunner, "_unlock_plugin_cache", original_unlock)
+    second = await asyncio.wait_for(
+        runner._spawn(workdir, ["apply", "-auto-approve"], timeout=5), timeout=2,
+    )
+    assert second.exit_code == 0
+
+
+def test_unlock_plugin_cache_closes_the_fd_even_if_the_unlock_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the fd is what actually drops the flock; the explicit
+    LOCK_UN failing must not leave the fd open (and so the lock held)."""
+    fd = os.open(tmp_path / ".init.lock", os.O_RDWR | os.O_CREAT, 0o644)
+
+    def _flock_raises(*args, **kwargs):  # noqa: ARG001
+        raise OSError("simulated LOCK_UN failure")
+
+    monkeypatch.setattr(runner_mod.fcntl, "flock", _flock_raises)
+    with pytest.raises(OSError, match="LOCK_UN"):
+        TerraformRunner._unlock_plugin_cache(fd)
+    with pytest.raises(OSError):  # EBADF — the fd is closed
+        os.fstat(fd)
 
 
 @pytest.mark.asyncio
@@ -3487,9 +3890,12 @@ def test_tenant_lease_cm_returns_kube_lease_mutex_when_incluster(
 ) -> None:
     """A projected ServiceAccount token present (the in-cluster case) —
     `_tenant_lease_cm` must hand back a real per-tenant `KubeLeaseMutex`,
-    named so a DIFFERENT tenant can never collide on the same Lease, sized
-    to cover the WHOLE plan/apply cycle (not just the timed apply step —
-    see _TENANT_LEASE_MARGIN_SECONDS's docstring)."""
+    named so a DIFFERENT tenant can never collide on the same Lease. The
+    WAITER budget covers the whole plan/apply cycle (not just the timed
+    apply step — see _TENANT_LEASE_MARGIN_SECONDS's comment); the lease
+    itself is short and renewed, so a holder that dies mid-apply frees
+    the tenant within seconds (TST 2026-09-06 — see the
+    _TENANT_LEASE_DURATION_SECONDS comment)."""
     from services.terraformer.src.kube_lease_mutex import KubeLeaseMutex
 
     token = tmp_path / "token"
@@ -3505,8 +3911,15 @@ def test_tenant_lease_cm_returns_kube_lease_mutex_when_incluster(
 
     assert isinstance(cm, KubeLeaseMutex)
     assert cm.name == "tf-tenant-t-001"
-    assert cm.lease_duration_seconds == 600 + runner_mod._TENANT_LEASE_MARGIN_SECONDS
     assert cm.acquire_timeout_seconds == 600 + runner_mod._TENANT_LEASE_MARGIN_SECONDS
+    assert cm.lease_duration_seconds == runner_mod._TENANT_LEASE_DURATION_SECONDS
+    assert cm.renew_interval_seconds == runner_mod._TENANT_LEASE_RENEW_SECONDS
+    # A dead holder must free the tenant well inside the 60s workspace
+    # SLO, and a live one must get several renewal attempts per duration
+    # so one transient API failure cannot cost it the lease.
+    assert cm.lease_duration_seconds <= 60
+    assert cm.lease_duration_seconds >= 4 * cm.renew_interval_seconds
+    assert cm.lease_duration_seconds < cm.acquire_timeout_seconds
 
 
 @pytest.mark.asyncio

@@ -23,10 +23,15 @@ client dependency added — this repo's convention is raw `httpx` against
 typed/REST surfaces, not a vendored SDK.
 
 This is a Lease used as an ADVISORY MUTEX, not full leader-election: one
-holder at a time, steal-on-expiry, best-effort release. There is no
-lease-renewal loop during the held section (a bounded terraform apply
-inside `lease_duration_seconds` is the whole point — see
-reconcile_cli.py's call site for the duration this is sized against).
+holder at a time, steal-on-expiry, best-effort release. Renewal is
+opt-in (`renew_interval_seconds`): reconcile_cli.py sizes its
+`lease_duration_seconds` to the Job's own hard deadline and never
+renews, while the per-tenant lease in terraform_runner.py renews on a
+short duration so a holder that dies mid-apply (kubelet eviction,
+OOM, node loss) frees the tenant within seconds rather than leaving
+the next signup to wait out a 15-minute lease — which is exactly what
+happened on TST 2026-09-06 10:02Z: a pod evicted 14s into an apply,
+and its successor polled the dead holder's lease for the full duration.
 """
 
 from __future__ import annotations
@@ -107,6 +112,7 @@ class KubeLeaseMutex:
         lease_duration_seconds: int = 900,
         acquire_timeout_seconds: int = 900,
         poll_interval_seconds: float = 5.0,
+        renew_interval_seconds: float | None = None,
         holder: str | None = None,
     ) -> None:
         self.name = name
@@ -116,9 +122,22 @@ class KubeLeaseMutex:
                 "PNEUMA_NAMESPACE is not set — required to scope the "
                 "reconcile Lease mutex to this pod's own namespace"
             )
+        if renew_interval_seconds is not None and not (
+            0 < renew_interval_seconds < lease_duration_seconds
+        ):
+            # A renewal that lands after the lease has already expired is
+            # no renewal at all — the next waiter has legitimately stolen
+            # it by then.
+            raise ValueError(
+                f"renew_interval_seconds={renew_interval_seconds!r} must be "
+                f"positive and shorter than lease_duration_seconds="
+                f"{lease_duration_seconds!r}"
+            )
         self.lease_duration_seconds = lease_duration_seconds
         self.acquire_timeout_seconds = acquire_timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
+        self.renew_interval_seconds = renew_interval_seconds
+        self._renew_task: asyncio.Task[None] | None = None
         # HOSTNAME is the pod name on every k8s pod (kubelet sets it) —
         # combined with a short random suffix so two pods that somehow
         # share a HOSTNAME (never true in-cluster, but defends a local
@@ -258,9 +277,96 @@ class KubeLeaseMutex:
                 exc_info=True,
             )
 
+    async def _renew_once(self, client: httpx.AsyncClient) -> bool:
+        """Push `renewTime` forward if the lease is still ours. Returns
+        False — and the caller stops renewing — once another holder has
+        taken it: we overran `leaseDurationSeconds` somewhere (a stalled
+        event loop, an API outage longer than the lease) and the steal
+        was legitimate; clobbering it back would put two appliers on the
+        same tenant, which is the one thing this mutex exists to stop."""
+        base = self._base_url()
+        resp = await client.get(f"{base}/{self.name}")
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        lease = resp.json()
+        spec = lease.get("spec", {}) or {}
+        if spec.get("holderIdentity") != self.holder:
+            return False
+        spec["renewTime"] = _now_rfc3339()
+        spec["leaseDurationSeconds"] = self.lease_duration_seconds
+        lease["spec"] = spec
+        update_resp = await client.put(f"{base}/{self.name}", json=lease)
+        if update_resp.status_code == 409:
+            # resourceVersion conflict — someone wrote the object between
+            # our GET and PUT. The only other writer of this lease is a
+            # waiter stealing it after seeing it expired, so a conflict
+            # most plausibly means we just LOST it. Re-read now and answer
+            # from the holder actually on the object — assuming "still
+            # ours" would be one more renewal of a lease we no longer own,
+            # i.e. an unwarranted "still held" signal for a full tick.
+            recheck = await client.get(f"{base}/{self.name}")
+            if recheck.status_code == 404:
+                return False
+            recheck.raise_for_status()
+            current = recheck.json().get("spec", {}) or {}
+            return bool(current.get("holderIdentity") == self.holder)
+        update_resp.raise_for_status()
+        return True
+
+    async def _renew_loop(self, interval: float) -> None:
+        async with self._client() as client:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    still_ours = await self._renew_once(client)
+                except Exception:
+                    # (CancelledError is a BaseException — it passes
+                    # straight through this clause, as it must.)
+                    # Transient API failure: keep trying — the lease has
+                    # `lease_duration_seconds - interval` of slack before
+                    # a waiter may steal it, and a single failed tick is
+                    # not evidence that we lost it.
+                    _LOG.warning(
+                        "lease %s/%s renewal failed for %s (retrying)",
+                        self.namespace,
+                        self.name,
+                        self.holder,
+                        exc_info=True,
+                    )
+                    continue
+                if not still_ours:
+                    _LOG.error(
+                        "lease %s/%s no longer held by %s — renewal "
+                        "stopped; the holder overran its lease duration",
+                        self.namespace,
+                        self.name,
+                        self.holder,
+                    )
+                    return
+
     async def __aenter__(self) -> "KubeLeaseMutex":
         await self.acquire()
+        if self.renew_interval_seconds is not None:
+            self._renew_task = asyncio.create_task(
+                self._renew_loop(self.renew_interval_seconds),
+                name=f"lease-renew:{self.namespace}/{self.name}",
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        task, self._renew_task = self._renew_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                _LOG.warning(
+                    "lease %s/%s renewal task ended with an error",
+                    self.namespace,
+                    self.name,
+                    exc_info=True,
+                )
         await self.release()

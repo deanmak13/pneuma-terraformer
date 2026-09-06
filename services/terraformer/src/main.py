@@ -113,10 +113,12 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     settings.terraform_workdir_root.mkdir(parents=True, exist_ok=True)
     logging.getLogger("terraformer").info(
-        "terraformer starting: env=%s modules=%s workdir=%s self_url=%s",
+        "terraformer starting: env=%s modules=%s workdir=%s "
+        "plugin_cache=%s self_url=%s",
         settings.env,
         settings.terraform_modules_root,
         settings.terraform_workdir_root,
+        settings.computed_plugin_cache_dir,
         settings.computed_self_url,
     )
     await _ensure_openbao_auth(settings)

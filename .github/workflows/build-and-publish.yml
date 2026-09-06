@@ -62,7 +62,18 @@ env:
   # apply failed on rabbitmq_permissions.bus_service["worker"] with
   # `Error 400 (bad_request): vhost_or_user_not_found`. The module defaults
   # are baked into this image, so the fix is inert until this ref moves.
-  DEPLOYMENTS_REF: 541b18e3b440963909389aadac6912596720a845
+  #
+  # Bumped 2026-09-06 to pneuma-deployments main (4fd2e724). The pin had
+  # drifted 24 infrastructure/terraform commits behind: the image actually
+  # running on TST (sha-107faab-tf04a0977) was a workflow_dispatch build
+  # against 04a09771, and the standing pin here still pointed 21 commits
+  # before THAT — so the next merge to main would have silently rebuilt
+  # the runner against an older module tree than the one deployed. Since
+  # 04a09771 the module tree gained #1828 (vendor-consumer index publishes
+  # vault-side field names), the adaptive-evidence HMAC service pairs, and
+  # #1654 (tenant-api->brain-api HMAC pair) — none of which the running
+  # image can execute until this ref moves.
+  DEPLOYMENTS_REF: 4fd2e724be97767ba7e0f3463bf6a27c7e8a0f7d
 
 # An image is an artifact OF a commit — two commits are two images and
 # neither supersedes the other; deployments pin sha-<40>. ref-keyed
