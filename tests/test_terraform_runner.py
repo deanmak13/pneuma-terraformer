@@ -1952,6 +1952,68 @@ async def test_spawn_init_cancelled_while_polling_the_cache_flock_leaks_nothing(
 
 
 @pytest.mark.asyncio
+async def test_spawn_frees_the_gate_and_permit_even_if_the_cache_unlock_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Release steps are isolated from each other: a failure dropping the
+    cache flock must still release the process-wide init gate and the
+    permit — a stranded gate would lock every later init in the pod
+    until it restarts, which is the incident class this PR exists to
+    end. The failure itself still surfaces to the caller."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=1,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc({"current": 0, "peak": 0}, hold=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+
+    def _unlock_raises(fd: int) -> None:
+        os.close(fd)
+        raise OSError("simulated flock/close failure on the cache lock fd")
+
+    original_unlock = TerraformRunner.__dict__["_unlock_plugin_cache"]
+    monkeypatch.setattr(TerraformRunner, "_unlock_plugin_cache", staticmethod(_unlock_raises))
+    with pytest.raises(OSError, match="simulated"):
+        await runner._spawn(workdir, ["init", "-input=false"], timeout=5)
+
+    assert not runner._init_gate().locked()
+    assert not runner._spawn_semaphore().locked()
+
+    # And the single permit is genuinely usable again — not just unlocked-looking.
+    monkeypatch.setattr(TerraformRunner, "_unlock_plugin_cache", original_unlock)
+    second = await asyncio.wait_for(
+        runner._spawn(workdir, ["apply", "-auto-approve"], timeout=5), timeout=2,
+    )
+    assert second.exit_code == 0
+
+
+def test_unlock_plugin_cache_closes_the_fd_even_if_the_unlock_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the fd is what actually drops the flock; the explicit
+    LOCK_UN failing must not leave the fd open (and so the lock held)."""
+    fd = os.open(tmp_path / ".init.lock", os.O_RDWR | os.O_CREAT, 0o644)
+
+    def _flock_raises(*args, **kwargs):  # noqa: ARG001
+        raise OSError("simulated LOCK_UN failure")
+
+    monkeypatch.setattr(runner_mod.fcntl, "flock", _flock_raises)
+    with pytest.raises(OSError, match="LOCK_UN"):
+        TerraformRunner._unlock_plugin_cache(fd)
+    with pytest.raises(OSError):  # EBADF — the fd is closed
+        os.fstat(fd)
+
+
+@pytest.mark.asyncio
 async def test_spawn_releases_semaphore_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

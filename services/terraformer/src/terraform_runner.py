@@ -878,8 +878,12 @@ class TerraformRunner:
 
     @staticmethod
     def _unlock_plugin_cache(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        # Closing the fd drops the flock on its own; the explicit unlock
+        # is the fast path. Never let it keep the fd open.
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _refuse_to_start(
         self,
@@ -1398,12 +1402,20 @@ class TerraformRunner:
             )
         finally:
             # Reverse acquisition order: cache flock, in-process gate,
-            # then the permit.
-            if held_cache_lock is not None:
-                self._unlock_plugin_cache(held_cache_lock)
-            if held_init_gate is not None:
-                held_init_gate.release()
-            sem.release()
+            # then the permit — each step isolated so a raise in one
+            # (an flock/close failure on the fd) can never skip the
+            # others: the gate and the permit are process-wide, and a
+            # stranded one locks every later init in this pod until it
+            # restarts.
+            try:
+                if held_cache_lock is not None:
+                    self._unlock_plugin_cache(held_cache_lock)
+            finally:
+                try:
+                    if held_init_gate is not None:
+                        held_init_gate.release()
+                finally:
+                    sem.release()
 
     def _vault_provider_hcl(self) -> str:
         """Render the generated `provider "vault" {}` block every
