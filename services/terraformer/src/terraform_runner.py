@@ -26,6 +26,7 @@ LAW alignment:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -58,6 +59,16 @@ _TENANT_MODULE = "tenant"
 # (almost) the whole budget" case, not a general minimum operation
 # timeout, so it only trips when there is truly no meaningful time left.
 _MIN_RUN_SECONDS_AFTER_QUEUE = 1
+
+# Cross-process half of the `terraform init` single-flight gate (see
+# TerraformRunner._init_gate): an flock on this file inside the plugin
+# cache dir. Today every process has its own emptyDir, so only the
+# in-process asyncio.Lock ever contends — but `terraform_plugin_cache_dir`
+# may point at a volume several pods/processes share, and Terraform's
+# concurrent-init hazard follows the DIRECTORY, not the process. Polled
+# (LOCK_NB) rather than blocking so the event loop keeps serving.
+_PLUGIN_CACHE_LOCK_FILE = ".init.lock"
+_PLUGIN_CACHE_LOCK_POLL_SECONDS = 0.25
 
 # ---------------------------------------------------------------------------
 # Transient infrastructure-provider conflict registry — LAW: design for N,
@@ -823,10 +834,98 @@ class TerraformRunner:
         cache — apply/plan/output/state read the symlinks init left in
         the workspace — so serialising init alone keeps every other
         command's concurrency intact. Lazily created for the same reason
-        as `_spawn_semaphore`."""
+        as `_spawn_semaphore`.
+
+        This is the in-process half; `_lock_plugin_cache` is the
+        cross-process half (an flock inside the cache dir itself), taken
+        right after it — the hazard belongs to the directory, and the
+        `terraform_plugin_cache_dir` override lets several processes or
+        pods share one."""
         if self._init_lock is None:
             self._init_lock = asyncio.Lock()
         return self._init_lock
+
+    async def _lock_plugin_cache(self, cache_dir: Path, budget: float) -> int | None:
+        """Take the cross-process `terraform init` lock: an exclusive
+        flock on `_PLUGIN_CACHE_LOCK_FILE` inside `cache_dir`, polled
+        non-blocking so the event loop keeps serving while another
+        process's init finishes unpacking. Returns the fd holding the
+        lock (release with `_unlock_plugin_cache`), or None once
+        `budget` seconds pass without it — the caller then fails with
+        exit 124, the same contract as the semaphore queue. flock is
+        per open file description, so this also serialises against any
+        other holder in THIS process (tests, or a second runner
+        instance) — `_init_gate` merely keeps in-process waiters off
+        the poll loop."""
+        fd = os.open(cache_dir / _PLUGIN_CACHE_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+        deadline = time.monotonic() + budget
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(fd)
+                        return None
+                    await asyncio.sleep(_PLUGIN_CACHE_LOCK_POLL_SECONDS)
+                else:
+                    return fd  # caller owns the fd (and the lock) from here
+        except BaseException:
+            # Cancelled mid-poll (the gRPC caller's deadline) — never
+            # leak the fd; it holds no lock on this branch.
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _unlock_plugin_cache(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    def _refuse_to_start(
+        self,
+        args: list[str],
+        timeout: float,
+        queued_s: float,
+        remaining: float,
+        workdir: Path,
+        safe_cmd: str,
+    ) -> TerraformResult:
+        """The exit-124 result for a spawn whose queue wait — for the
+        permit, or for `init` also the two halves of the init gate —
+        consumed its budget down to the `_MIN_RUN_SECONDS_AFTER_QUEUE`
+        floor. One helper so every wait in `_spawn_once` applies the
+        SAME floor with the same message: a doomed run must not start
+        just because it queued on the gate rather than on the permit."""
+        _LOG.warning(
+            "tf spawn refusing to start: queue wait %.1fs left only %.1fs of the "
+            "%ds budget (floor=%ds): workdir=%s cmd=%s",
+            queued_s, remaining, timeout, _MIN_RUN_SECONDS_AFTER_QUEUE, workdir, safe_cmd,
+        )
+        return TerraformResult(
+            exit_code=124,
+            stdout="",
+            stderr=(
+                f"terraform {args[0]} queue wait ({queued_s:.1f}s) consumed the "
+                f"{timeout}s budget, leaving only {remaining:.1f}s to run — refusing "
+                "to start rather than begin work that would be killed mid-run"
+            ),
+            outputs={},
+        )
+
+    @staticmethod
+    def _init_gate_timeout(behind: str, waited: float, timeout: float) -> TerraformResult:
+        """The exit-124 result for an `init` that waited out its whole
+        remaining budget on one half of the init gate (`behind` names
+        which) without ever getting it."""
+        return TerraformResult(
+            exit_code=124,
+            stdout="",
+            stderr=(
+                f"terraform init queued too long behind {behind} "
+                f"(waited >{waited:.1f}s of the {timeout}s budget)"
+            ),
+            outputs={},
+        )
 
     def _spawn_queue_budget(self, timeout: float) -> int:
         """Seconds a given `_spawn` call may wait to ACQUIRE a concurrency
@@ -1145,10 +1244,12 @@ class TerraformRunner:
         # is a BaseException, not caught by any `except` clause here, so
         # only a `finally` reliably runs on it).
         #
-        # `init` additionally holds the single-flight init gate (see
-        # _init_gate) — set only once actually acquired, so the same
-        # `finally` releases it exactly on the branch that took it.
+        # `init` additionally holds both halves of the single-flight init
+        # gate (see _init_gate / _lock_plugin_cache) — each set only once
+        # actually acquired, so the same `finally` releases exactly what
+        # was taken.
         held_init_gate: asyncio.Lock | None = None
+        held_cache_lock: int | None = None
         try:
             _queued_s = time.monotonic() - _t0
             if _queued_s > 1.0:
@@ -1168,31 +1269,21 @@ class TerraformRunner:
             # worse than failing fast here with nothing started.
             remaining = self._effective_run_timeout(timeout, _queued_s)
             if remaining <= _MIN_RUN_SECONDS_AFTER_QUEUE:
-                _LOG.warning(
-                    "tf spawn refusing to start: queue wait %.1fs left only "
-                    "%.1fs of the %ds budget (floor=%ds): workdir=%s cmd=%s",
-                    _queued_s, remaining, timeout, _MIN_RUN_SECONDS_AFTER_QUEUE,
-                    workdir, safe_cmd,
-                )
-                return TerraformResult(
-                    exit_code=124,
-                    stdout="",
-                    stderr=(
-                        f"terraform {args[0]} queue wait ({_queued_s:.1f}s) "
-                        f"consumed the {timeout}s budget, leaving only "
-                        f"{remaining:.1f}s to run — refusing to start rather "
-                        f"than begin work that would be killed mid-run"
-                    ),
-                    outputs={},
-                )
+                return self._refuse_to_start(args, timeout, _queued_s, remaining, workdir, safe_cmd)
 
             # Single-flight `terraform init` — the only command that
             # writes the shared plugin cache, which Terraform documents
             # as unsafe under concurrent inits (see _init_gate). Taken
             # INSIDE the concurrency permit so the process cap above
-            # still bounds everything; bounded by what is left of this
-            # call's own budget, and that budget is re-derived afterwards
-            # so the subprocess never gets more than the caller allowed.
+            # still bounds everything. Two halves, same order every
+            # time: the in-process gate, then the cross-process flock
+            # on the cache dir. Each wait is bounded by what is left of
+            # this call's own budget, and the budget — and the floor
+            # check — are re-derived afterwards: an init that queued
+            # here for most of its budget must fail fast exactly like
+            # one that queued for the permit, not start and get killed
+            # mid-unpack (which is how a half-written package lands in
+            # the cache for every later init to symlink to).
             if args[0] == "init":
                 init_gate = self._init_gate()
                 if init_gate.locked():
@@ -1204,19 +1295,25 @@ class TerraformRunner:
                 try:
                     await asyncio.wait_for(init_gate.acquire(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    return TerraformResult(
-                        exit_code=124,
-                        stdout="",
-                        stderr=(
-                            f"terraform init queued too long behind another "
-                            f"terraform init (waited >{remaining:.1f}s of the "
-                            f"{timeout}s budget)"
-                        ),
-                        outputs={},
+                    return self._init_gate_timeout(
+                        "another terraform init in this process", remaining, timeout,
                     )
                 held_init_gate = init_gate
+                remaining = self._effective_run_timeout(timeout, time.monotonic() - _t0)
+                held_cache_lock = await self._lock_plugin_cache(
+                    plugin_cache_dir, budget=max(remaining, 0.0),
+                )
+                if held_cache_lock is None:
+                    return self._init_gate_timeout(
+                        "another terraform init on the shared plugin cache",
+                        remaining, timeout,
+                    )
                 _queued_s = time.monotonic() - _t0
                 remaining = self._effective_run_timeout(timeout, _queued_s)
+                if remaining <= _MIN_RUN_SECONDS_AFTER_QUEUE:
+                    return self._refuse_to_start(
+                        args, timeout, _queued_s, remaining, workdir, safe_cmd,
+                    )
 
             # Logged AFTER acquisition (and the refuse-to-start check
             # above) so this line reliably means "a process actually
@@ -1300,6 +1397,10 @@ class TerraformRunner:
                 outputs={},
             )
         finally:
+            # Reverse acquisition order: cache flock, in-process gate,
+            # then the permit.
+            if held_cache_lock is not None:
+                self._unlock_plugin_cache(held_cache_lock)
             if held_init_gate is not None:
                 held_init_gate.release()
             sem.release()

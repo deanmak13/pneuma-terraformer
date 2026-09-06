@@ -5,7 +5,9 @@ without invoking the real terraform CLI.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -1795,6 +1797,112 @@ async def test_spawn_init_waiting_on_the_gate_is_bounded_by_its_own_budget(
     assert result.exit_code == 124
     assert "behind another terraform init" in result.stderr
     assert not runner._spawn_semaphore().locked()
+
+
+@pytest.mark.asyncio
+async def test_spawn_init_that_queued_on_the_gate_past_the_floor_refuses_to_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refuse-to-start floor (_MIN_RUN_SECONDS_AFTER_QUEUE) is
+    re-applied AFTER the init-gate wait, not only after the permit wait:
+    an init that got the gate with under a second of its budget left
+    must not start and be killed mid-unpack — that is exactly how a
+    half-written provider package lands in the shared cache for every
+    later init to symlink to. Gate held ~0.7s of a 1.5s budget → the
+    0.8s left is under the 1s floor → exit 124, nothing spawned."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    async def _never_exec(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("must not spawn with under a second of budget left")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+
+    gate = runner._init_gate()
+    await gate.acquire()
+
+    async def _release_gate_later() -> None:
+        await asyncio.sleep(0.7)
+        gate.release()
+
+    releaser = asyncio.create_task(_release_gate_later())
+    try:
+        result = await runner._spawn(workdir, ["init", "-input=false"], timeout=1.5)
+    finally:
+        await releaser
+
+    assert result.exit_code == 124
+    assert "refusing to start" in result.stderr
+    assert not gate.locked()
+    assert not runner._spawn_semaphore().locked()
+
+
+@pytest.mark.asyncio
+async def test_spawn_init_is_single_flighted_across_processes_via_the_cache_flock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-process gate cannot see another process's init, and the
+    `terraform_plugin_cache_dir` override lets several processes share
+    one cache. The runner therefore also takes an flock on a file inside
+    the cache dir for the init's lifetime. Here the test IS the other
+    process: it holds that flock on its own fd → an init must give up
+    with exit 124 (bounded by its own budget, gate and permit freed);
+    once released, the same init runs clean and leaves the lock free."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    cache_dir = settings.computed_plugin_cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / ".init.lock"
+    foreign_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(foreign_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        async def _never_exec(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("must not spawn while another process holds the cache lock")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+        blocked = await runner._spawn(workdir, ["init", "-input=false"], timeout=1.2)
+    finally:
+        fcntl.flock(foreign_fd, fcntl.LOCK_UN)
+        os.close(foreign_fd)
+
+    assert blocked.exit_code == 124
+    assert "shared plugin cache" in blocked.stderr
+    assert not runner._init_gate().locked()
+    assert not runner._spawn_semaphore().locked()
+
+    async def _fast_exec(*args, **kwargs):  # noqa: ARG001
+        return _FakeProc({"current": 0, "peak": 0}, hold=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fast_exec)
+    released = await asyncio.wait_for(
+        runner._spawn(workdir, ["init", "-input=false"], timeout=5), timeout=2,
+    )
+    assert released.exit_code == 0
+
+    # The runner released its flock on exit — a fresh holder gets it at once.
+    probe_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(probe_fd)
 
 
 @pytest.mark.asyncio
