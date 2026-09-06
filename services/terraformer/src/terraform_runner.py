@@ -229,19 +229,31 @@ async def _no_op_async_cm() -> AsyncIterator[None]:
 
 
 # Margin added to a tenant apply/destroy's own `effective_timeout` when
-# sizing the cross-process Lease `_tenant_lease_cm` acquires (see that
-# method) — NOT a margin on the timed `_spawn` call itself. The Lease is
-# held from BEFORE `_ensure_workspace`/`_init`/`_import_preexisting_
-# resources` even start, none of which are bounded by `effective_timeout`
-# (that budget is only ever passed to the timed `apply`/`destroy` _spawn
-# call) — sizing the lease off `effective_timeout` alone would let it
-# expire, and be stolen, WHILE a legitimate holder is still doing that
-# up-front work, recreating the exact same-tenant collision this mutex
-# exists to prevent (live 2026-08-18, tenant 72f36de4 — see
-# _kill_process_group's docstring). Deliberately generous: a lease that's
-# too long only delays a genuinely crashed holder's slot from
-# self-expiring; a lease that's too short actively re-triggers the bug.
+# sizing how long a WAITER polls for the cross-process Lease
+# `_tenant_lease_cm` acquires (see that method) — NOT a margin on the
+# timed `_spawn` call itself. The holder keeps the Lease from BEFORE
+# `_ensure_workspace`/`_init`/`_import_preexisting_resources` even start,
+# none of which are bounded by `effective_timeout` (that budget is only
+# ever passed to the timed `apply`/`destroy` _spawn call), so a waiter
+# that gave up after `effective_timeout` alone would fail while the
+# holder is still legitimately doing that up-front work.
 _TENANT_LEASE_MARGIN_SECONDS = 300
+
+# How long the tenant Lease stays valid without a renewal, and how often
+# the holder renews it. These used to be one number — the acquire
+# timeout above (900s) — with no renewal, so a holder that died mid-apply
+# left its tenant locked for the full 15 minutes: TST 2026-09-06 10:02Z,
+# pod terraformer-79c74b9fcd-2ddqj evicted 14s into tenant 0270dc40's
+# apply, its successor polled the dead holder's lease until ~10:17Z and
+# the owner sat on /signup/created the whole time. With renewal every
+# `_TENANT_LEASE_RENEW_SECONDS` a live holder never expires (the
+# 2026-08-18 tenant-72f36de4 collision `_kill_process_group` documents
+# stays impossible — the duration below is only ever reached by a holder
+# that has actually stopped), while a dead holder frees the tenant
+# within one duration. Four renewal attempts fit inside one duration, so
+# a single transient API failure cannot cost the lease.
+_TENANT_LEASE_DURATION_SECONDS = 60
+_TENANT_LEASE_RENEW_SECONDS = 15
 
 # The pneuma-deployments tenant module's `profile` variable (infrastructure/
 # terraform/modules/tenant/variables.tf) models "non-regulated" as `null` —
@@ -731,15 +743,19 @@ class TerraformRunner:
             return _no_op_async_cm()
         from services.terraformer.src.kube_lease_mutex import KubeLeaseMutex
 
-        duration = int(effective_timeout) + _TENANT_LEASE_MARGIN_SECONDS
         return KubeLeaseMutex(
             f"tf-tenant-{tenant_id}",
-            lease_duration_seconds=duration,
+            # Short and renewed (see the constants' comment): a live
+            # holder renews every _TENANT_LEASE_RENEW_SECONDS, a dead one
+            # frees the tenant within _TENANT_LEASE_DURATION_SECONDS.
+            lease_duration_seconds=_TENANT_LEASE_DURATION_SECONDS,
+            renew_interval_seconds=_TENANT_LEASE_RENEW_SECONDS,
             # Bounded, not unbounded: a caller that waited this long for
             # another holder to finish was already past any sane RPC
             # deadline — failing fast with a clear LeaseAcquireTimeout
             # beats hanging silently past it.
-            acquire_timeout_seconds=duration,
+            acquire_timeout_seconds=int(effective_timeout)
+            + _TENANT_LEASE_MARGIN_SECONDS,
             # Faster than KubeLeaseMutex's own 5s default — a tenant
             # apply that's actually queued behind another one should
             # notice the lease freed up promptly rather than adding up
@@ -1015,6 +1031,19 @@ class TerraformRunner:
         # stage + tf/cli.tfrc) — terraform init never reaches the public
         # registry.
         env["TF_CLI_CONFIG_FILE"] = self._settings.tf_cli_config_file
+        # One unpacked provider set per pod, symlinked into every
+        # workspace's .terraform/providers — instead of one full copy
+        # per workspace. 104 kubelet evictions on TST (2026-08-19 →
+        # 2026-09-06, every one `Usage of EmptyDir volume "workspace"
+        # exceeds the limit "2Gi"`) were this: ~10 tenant inits filled
+        # the volume, the pod died mid-apply, and the next signup waited
+        # out the dead pod's lease. Terraform refuses a cache dir that
+        # does not exist yet, so create it here rather than only at pod
+        # startup — the reconcile CronJob runs this same code path from
+        # a fresh container with no lifespan hook.
+        plugin_cache_dir = self._settings.computed_plugin_cache_dir
+        plugin_cache_dir.mkdir(parents=True, exist_ok=True)
+        env["TF_PLUGIN_CACHE_DIR"] = str(plugin_cache_dir)
         env["AWS_ACCESS_KEY_ID"] = self._settings.tf_state_backend_access_key
         env["AWS_SECRET_ACCESS_KEY"] = self._settings.tf_state_backend_secret_key
         # The S3 backend's `endpoints.s3` attribute is object-typed and

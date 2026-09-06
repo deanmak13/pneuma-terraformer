@@ -18,3 +18,19 @@ provider_installation {
     include = ["*/*/*"]
   }
 }
+
+# Provider-plugin cache. The directory itself is TF_PLUGIN_CACHE_DIR on
+# every subprocess (settings.computed_plugin_cache_dir — inside the
+# writable workspace volume, since the root filesystem is read-only), so
+# each pod unpacks the mirror ONCE and every workspace's
+# .terraform/providers is a set of symlinks into it. Without this each
+# `terraform init` unpacked ~200MiB into its own workspace and ~10
+# tenants filled the 2Gi volume — kubelet then evicted the pod mid-apply.
+#
+# Every workspace here is generated fresh from the baked module (no
+# .terraform.lock.hcl is ever committed or carried over), and since 1.4
+# Terraform only reuses a cached package when the lock file already
+# vouches for it. This is exactly the workflow the setting below exists
+# for: a single platform (linux_amd64) installed from a pinned, baked
+# mirror, so the "incomplete lock file" it warns about cannot arise.
+plugin_cache_may_break_dependency_lock_file = true

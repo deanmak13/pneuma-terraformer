@@ -47,6 +47,19 @@ class Settings(BaseSettings):
         default=Path("/var/lib/terraformer/workspaces"),
         description="Per-tenant workspace dir; one subdirectory per tenant_id",
     )
+    terraform_plugin_cache_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Shared provider-plugin cache (TF_PLUGIN_CACHE_DIR on every "
+            "terraform subprocess). None = `<terraform_workdir_root>/"
+            ".plugin-cache`, i.e. inside the one writable volume both the "
+            "pod and the reconcile CronJob mount (the root filesystem is "
+            "read-only). Without a cache, every `terraform init` unpacks "
+            "the full provider set (~200MiB) into its own workspace; N "
+            "tenants later the workspace volume hits its sizeLimit and "
+            "kubelet evicts the pod mid-apply."
+        ),
+    )
     terraform_standalone_root: Path = Field(
         default=Path("/app/infrastructure/terraform/standalone"),
         description="Root containing standalone Terraform harnesses (platform-secrets-apply/, etc.). Sibling of terraform_modules_root.",
@@ -254,6 +267,14 @@ class Settings(BaseSettings):
     @property
     def computed_grpc_target(self) -> str:
         return f"terraformer.{self.pneuma_namespace}.svc.cluster.local:{self.grpc_port}"
+
+    @property
+    def computed_plugin_cache_dir(self) -> Path:
+        if self.terraform_plugin_cache_dir is not None:
+            return self.terraform_plugin_cache_dir
+        # A dot-prefixed sibling of the per-tenant workspaces: tenant_ids
+        # are UUIDs, so no workspace can ever be named this.
+        return self.terraform_workdir_root / ".plugin-cache"
 
     @model_validator(mode="after")
     def _validate_enabled_provider_credentials(self) -> Settings:

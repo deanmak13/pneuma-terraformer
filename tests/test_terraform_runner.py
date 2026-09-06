@@ -1105,6 +1105,79 @@ async def test_spawn_sets_tf_cli_config_file_and_provider_env(tmp_path: Path) ->
     assert captured_env["PGPASSWORD"] == settings.postgres_superuser_password
 
 
+async def _spawn_capturing_env(runner: TerraformRunner, workdir: Path) -> dict[str, str]:
+    captured_env: dict[str, str] = {}
+    orig_create_subprocess_exec = __import__("asyncio").create_subprocess_exec
+
+    async def _capturing_exec(*args, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        return await orig_create_subprocess_exec(*args, **kwargs)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_capturing_exec):
+        await runner._spawn(workdir, ["--version"], timeout=5)
+    return captured_env
+
+
+@pytest.mark.asyncio
+async def test_spawn_sets_and_creates_shared_plugin_cache_dir(tmp_path: Path) -> None:
+    """Regression for the 2026-08-19 → 2026-09-06 TST eviction series (104
+    `Usage of EmptyDir volume "workspace" exceeds the limit "2Gi"`): every
+    subprocess must carry TF_PLUGIN_CACHE_DIR so provider packages are
+    unpacked once per pod and symlinked into each workspace, and the dir
+    must exist before terraform runs (terraform refuses a missing cache
+    dir) — created by `_spawn` itself, because the reconcile CronJob runs
+    this path from a fresh container with no lifespan hook."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/usr/bin/env",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    expected = settings.terraform_workdir_root / ".plugin-cache"
+    assert not expected.exists()
+
+    captured_env = await _spawn_capturing_env(TerraformRunner(settings), workdir)
+
+    assert captured_env["TF_PLUGIN_CACHE_DIR"] == str(expected)
+    assert expected.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_spawn_honours_explicit_plugin_cache_dir(tmp_path: Path) -> None:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/usr/bin/env",
+        terraform_plugin_cache_dir=tmp_path / "elsewhere" / "cache",
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+
+    captured_env = await _spawn_capturing_env(TerraformRunner(settings), workdir)
+
+    assert captured_env["TF_PLUGIN_CACHE_DIR"] == str(tmp_path / "elsewhere" / "cache")
+    assert (tmp_path / "elsewhere" / "cache").is_dir()
+
+
+def test_baked_cli_config_lets_the_cache_serve_fresh_workspaces() -> None:
+    """Since Terraform 1.4 a cached provider is only reused when the
+    workspace's .terraform.lock.hcl already vouches for it. Every tenant
+    workspace here is generated fresh (no lock file), so without this
+    setting TF_PLUGIN_CACHE_DIR would be inert and every init would still
+    unpack the full provider set. Asserts on the effective (non-comment)
+    lines of the baked config, not on its prose."""
+    tfrc = Path(__file__).resolve().parents[1] / "tf" / "cli.tfrc"
+    effective = [
+        line.strip()
+        for line in tfrc.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert "plugin_cache_may_break_dependency_lock_file = true" in effective
+
+
 @pytest.mark.asyncio
 async def test_spawn_env_keeps_vault_addr_but_drops_vault_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -3487,9 +3560,12 @@ def test_tenant_lease_cm_returns_kube_lease_mutex_when_incluster(
 ) -> None:
     """A projected ServiceAccount token present (the in-cluster case) —
     `_tenant_lease_cm` must hand back a real per-tenant `KubeLeaseMutex`,
-    named so a DIFFERENT tenant can never collide on the same Lease, sized
-    to cover the WHOLE plan/apply cycle (not just the timed apply step —
-    see _TENANT_LEASE_MARGIN_SECONDS's docstring)."""
+    named so a DIFFERENT tenant can never collide on the same Lease. The
+    WAITER budget covers the whole plan/apply cycle (not just the timed
+    apply step — see _TENANT_LEASE_MARGIN_SECONDS's comment); the lease
+    itself is short and renewed, so a holder that dies mid-apply frees
+    the tenant within seconds (TST 2026-09-06 — see the
+    _TENANT_LEASE_DURATION_SECONDS comment)."""
     from services.terraformer.src.kube_lease_mutex import KubeLeaseMutex
 
     token = tmp_path / "token"
@@ -3505,8 +3581,15 @@ def test_tenant_lease_cm_returns_kube_lease_mutex_when_incluster(
 
     assert isinstance(cm, KubeLeaseMutex)
     assert cm.name == "tf-tenant-t-001"
-    assert cm.lease_duration_seconds == 600 + runner_mod._TENANT_LEASE_MARGIN_SECONDS
     assert cm.acquire_timeout_seconds == 600 + runner_mod._TENANT_LEASE_MARGIN_SECONDS
+    assert cm.lease_duration_seconds == runner_mod._TENANT_LEASE_DURATION_SECONDS
+    assert cm.renew_interval_seconds == runner_mod._TENANT_LEASE_RENEW_SECONDS
+    # A dead holder must free the tenant well inside the 60s workspace
+    # SLO, and a live one must get several renewal attempts per duration
+    # so one transient API failure cannot cost it the lease.
+    assert cm.lease_duration_seconds <= 60
+    assert cm.lease_duration_seconds >= 4 * cm.renew_interval_seconds
+    assert cm.lease_duration_seconds < cm.acquire_timeout_seconds
 
 
 @pytest.mark.asyncio
