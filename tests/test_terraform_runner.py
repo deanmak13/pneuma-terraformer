@@ -1906,6 +1906,52 @@ async def test_spawn_init_is_single_flighted_across_processes_via_the_cache_floc
 
 
 @pytest.mark.asyncio
+async def test_spawn_init_cancelled_while_polling_the_cache_flock_leaks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gRPC deadline cancels the init while it is still polling for the
+    cache flock: the CancelledError must propagate, and the lock-file fd
+    opened for the poll, the in-process gate and the permit must all be
+    released — the pod would otherwise leak an fd per cancelled init."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_binary="/bin/true",
+        max_concurrent_terraform_runs=4,
+    )
+    settings.terraform_workdir_root.mkdir(parents=True)
+    workdir = settings.terraform_workdir_root / "ws"
+    workdir.mkdir()
+    runner = TerraformRunner(settings)
+
+    cache_dir = settings.computed_plugin_cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    open_fds_before = len(os.listdir("/proc/self/fd"))
+    foreign_fd = os.open(cache_dir / ".init.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(foreign_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        async def _never_exec(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("must not spawn while another process holds the cache lock")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _never_exec)
+        task = asyncio.create_task(
+            runner._spawn(workdir, ["init", "-input=false"], timeout=30),
+        )
+        await asyncio.sleep(0.4)  # well inside the poll loop
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        fcntl.flock(foreign_fd, fcntl.LOCK_UN)
+        os.close(foreign_fd)
+
+    assert len(os.listdir("/proc/self/fd")) == open_fds_before
+    assert not runner._init_gate().locked()
+    assert not runner._spawn_semaphore().locked()
+
+
+@pytest.mark.asyncio
 async def test_spawn_releases_semaphore_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
