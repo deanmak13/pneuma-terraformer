@@ -487,6 +487,54 @@ class _PlatformResourcesImportEntry:
 # services/common/rpc/service_pairs.py (pneuma-engine); this is the SAME
 # convention one level removed. Verified against pneuma-deployments
 # origin/main at authoring time (2026-08-19).
+def _kv_v2_import_id(mount: str, name: str) -> str:
+    """The `terraform import` ID for a `vault_kv_secret_v2` resource —
+    ONE derivation (LAW: design for N), used by every hmac entry below.
+
+    hashicorp/terraform-provider-vault@v4.8.0's `vault_kv_secret_v2` uses
+    the SDKv2 passthrough Importer (`schema.ImportStatePassthroughContext`,
+    vault/resource_kv_secret_v2.go:54-55) — `d.Id()` becomes `path` verbatim,
+    then `kvSecretV2Read` (:238) parses `mount`/`name` back OUT of that
+    single string via `getKVV2SecretMountFromPath`/`getKVV2SecretNameFromPath`
+    (:251,:256; error text "unable to read mount from ID %s, err=%s" at
+    :253). Those helpers (:403-415) match `path` against
+    `kvV2SecretMountFromPathRegex = regexp.MustCompile("^(.+?)/data/.+$")`
+    (:24) — the regex REQUIRES a literal `/data/` segment; on no match,
+    `getKVV2SecretMountFromPath` returns the sentinel `fmt.Errorf("no mount
+    found")` (:405). The website docs' own import example confirms the same
+    shape: `terraform import vault_kv_secret_v2.example kvv2/data/secret`
+    (website/docs/r/kv_secret_v2.html.md "Import").
+
+    Live evidence this fixes (TST `platform-secrets-reconcile` Job
+    `psr-tf32-2314`, 2026-09-07T23:14Z, image `sha-1e85c06-tf45c1dcc`, first
+    run of #32 — #32's module-qualified-address fix worked, this probe was
+    the very next one): `terraform import -input=false
+    'module.platform_resources.vault_kv_secret_v2.inter_service_hmac
+    ["brain-brain"]' pneuma/infra/inter-service-hmac/brain-brain` failed
+    with `Error: unable to read mount from ID
+    pneuma/infra/inter-service-hmac/brain-brain, err=no mount found` — the
+    bare `<mount>/<name>` form this file used to build previously never
+    matches the regex above, so `_classify_import_failure` correctly
+    UNCLASSIFIED it (LAW: unknown is not benign) and the reconcile failed
+    closed, three attempts identical, instead of silently treating a
+    malformed ID as "does not pre-exist". The comment this replaced
+    (`resource_id="<mount>/<path>" ... NOT the "/data/" HTTP-API form`) had
+    the provider's contract inverted — `/data/` IS the form
+    `getKVV2SecretMountFromPath` requires, not an alternative to it.
+
+    A genuine not-found (a well-formed `<mount>/data/<name>` ID pointing at
+    a secret that truly does not exist in Vault) is a DIFFERENT code path —
+    `kvSecretV2Read`'s `secret == nil` branch (:279-283) swallows it into
+    `d.SetId(""); return nil` (a WARN-level `log.Printf`, no error
+    returned) — the exact same soft-not-found shape the round-1/round-2
+    provenance paragraphs above `_IMPORT_FAILURE_SIGNATURES` already
+    documented for `postgresql_role`/`rabbitmq_vhost`/`rabbitmq_user`, so
+    it lands on the generic terraform-core "Cannot import non-existent
+    remote object" row, never a vault-specific one (see the now-deleted
+    `no secret found at` row's removal note below the signature table)."""
+    return f"{mount}/data/{name}"
+
+
 _INTER_SERVICE_HMAC_PAIRS: tuple[str, ...] = (
     "brain-brain",
     "connector-gateway-agno",
@@ -531,6 +579,26 @@ def _platform_resources_import_entries(env: str) -> tuple[_PlatformResourcesImpo
     `sha-c79f263-tf45c1dcc`). Addresses are now derived from
     `_PLATFORM_RESOURCES_MODULE_ADDRESS`, and an unclassified import
     failure fails the reconcile closed.
+
+    2026-09-07T23:14Z (#32 merged, image `sha-1e85c06-tf45c1dcc`, Job
+    `psr-tf32-2314`, first run): the module-address fix above WORKED — log
+    shows `tf import: adopted pre-existing activepieces_app_role
+    (module.platform_resources.postgresql_role.activepieces_app=
+    activepieces_app)` and the same for `activepieces_database` — but the
+    very next probe, `terraform import -input=false
+    'module.platform_resources.vault_kv_secret_v2.inter_service_hmac
+    ["brain-brain"]' pneuma/infra/inter-service-hmac/brain-brain`, failed
+    with `Error: unable to read mount from ID
+    pneuma/infra/inter-service-hmac/brain-brain, err=no mount found`,
+    UNCLASSIFIED, `platform-resources reconcile FAILED (env=tst): terraform
+    import failed (exit=1)` — fail-closed exactly as designed (three
+    attempts identical). Root cause: the comment this replaced asserted the
+    import ID is the bare logical path "NOT the /data/ HTTP-API form" — the
+    OPPOSITE of hashicorp/terraform-provider-vault@v4.8.0's actual contract
+    (`getKVV2SecretMountFromPath`'s regex REQUIRES `/data/` — see
+    `_kv_v2_import_id`'s docstring for the full file:line trail). Every
+    hmac entry's `resource_id` below is now built through that ONE helper
+    (LAW: design for N) instead of an inlined f-string.
     """
     entries = [
         _PlatformResourcesImportEntry(
@@ -563,15 +631,17 @@ def _platform_resources_import_entries(env: str) -> tuple[_PlatformResourcesImpo
                 name=f"inter_service_hmac_{pair}",
                 module_address=f'vault_kv_secret_v2.inter_service_hmac["{pair}"]',
                 # hashicorp/vault provider: a vault_kv_secret_v2's import
-                # ID is "<mount>/<path>" (the bare KV-v2 logical path, NOT
-                # the "/data/" HTTP-API form used elsewhere in this file
-                # for `vault_kv_secret_v2` DATA SOURCE reads). Mount is
-                # hardcoded "pneuma" by the standalone harness's
-                # `module "platform_resources" { vault_kv_mount = "pneuma" }`
-                # block (infrastructure/terraform/standalone/platform-
-                # resources-apply/main.tf) — the same singular platform
-                # mount every other workspace on this runner uses.
-                resource_id=f"pneuma/infra/inter-service-hmac/{pair}",
+                # ID IS the "/data/" HTTP-API form "<mount>/data/<name>" —
+                # `getKVV2SecretMountFromPath`'s regex REQUIRES the literal
+                # `/data/` segment (see `_kv_v2_import_id`'s docstring for
+                # the full file:line provenance trail and the live TST
+                # failure this replaces). Mount is hardcoded "pneuma" by
+                # the standalone harness's `module "platform_resources" {
+                # vault_kv_mount = "pneuma" }` block
+                # (infrastructure/terraform/standalone/platform-resources-
+                # apply/main.tf:132) — the same singular platform mount
+                # every other workspace on this runner uses.
+                resource_id=_kv_v2_import_id("pneuma", f"infra/inter-service-hmac/{pair}"),
             )
         )
     return tuple(entries)
@@ -829,6 +899,49 @@ class _ImportFailureSignature:
 # already covered by the `the specified bucket does not exist` row below
 # — the bare `NoSuchBucket` S3 error CODE is never part of that returned
 # string, so nothing this provider emits ever reaches this row's regex).
+#
+# Round-3-review fixes (2026-09-08, same pinned sources, WebFetch +
+# curl-verified line numbers — see PR body "Round-3 fixes" table):
+#
+# Minor 1 — dropped the `no secret found at` row entirely. It cited
+# "hashicorp/vault provider (KV-v2 read) — platform-resources path", which
+# names no file:line and matches no text either provider function actually
+# emits. The round-2 paragraph above already established the real
+# mechanism: `vault_kv_secret_v2` (hashicorp/terraform-provider-vault@
+# v4.8.0 vault/resource_kv_secret_v2.go:54-55) uses the identical
+# passthrough Importer as postgresql_role/rabbitmq_vhost, and its Read
+# function's genuine not-found branch (`kvSecretV2Read`, secret == nil at
+# :279-283) swallows into `d.SetId(""); return nil` (a WARN `log.Printf`,
+# "secret (%s) not found, removing from state" — confirmed at :282, not
+# :281-283 as round-2 cited) with no error text at all — so a genuine
+# not-found lands on the generic terraform-core "Cannot import
+# non-existent remote object" row above, exactly like postgresql_role/
+# rabbitmq. Nothing in the source produces "no secret found at" in any
+# form; the classification-table test now pins this text as UNCLASSIFIED
+# (was NOT_FOUND) as the RED proof for the deletion.
+#
+# Minor 2 — dropped the `(42704)` row. curl-verified against lib/pq@
+# v1.10.9 error.go:452-454: `func (err *Error) Error() string { return
+# "pq: " + err.Message }` — the SQLSTATE code (`err.Code`, a SEPARATE
+# struct field) is never appended to the string a caller sees; no
+# parenthesised code of any kind is ever part of `pq:`-prefixed text.
+# cyrilgdn/terraform-provider-postgresql@v1.22.0's Read paths confirm the
+# same swallow-to-`SetId("")` shape as the role/rabbitmq/vault rows above
+# for a genuine not-found (resource_postgresql_role.go:436-437 `case err
+# == sql.ErrNoRows: log.Printf("[WARN] PostgreSQL ROLE (%s) not found");
+# d.SetId("")`; resource_postgresql_database.go:313-314, identical) — so
+# even the un-parenthesised `pq: role "x" does not exist` row below is,
+# by the same reasoning, not currently confirmed reachable via `terraform
+# import postgresql_role`/`postgresql_database` (kept defensively, same
+# convention as the minio "the specified bucket does not exist" row).
+# `(42704)` was additionally wrong on its own terms even ignoring
+# reachability: 42704 (`undefined_object`) is the role/schema code, but
+# `pq: database "x" does not exist` is SQLSTATE 3D000 (`invalid_catalog_
+# name`, lib/pq error.go:231) — a fixed `(42704)` string would never have
+# matched the database case it was partly meant to cover. The
+# classification-table test now pins `does not exist (SQLSTATE 42704)`-
+# shaped text as classified by the `pq:` row alone (its regex has no
+# SQLSTATE clause) — the RED proof for the deletion.
 _IMPORT_FAILURE_SIGNATURES: tuple[_ImportFailureSignature, ...] = (
     _ImportFailureSignature(
         outcome=_ImportOutcome.ALREADY_MANAGED,
@@ -853,17 +966,17 @@ _IMPORT_FAILURE_SIGNATURES: tuple[_ImportFailureSignature, ...] = (
     _ImportFailureSignature(
         outcome=_ImportOutcome.NOT_FOUND,
         pattern=re.compile(r'pq:\s+(role|database|schema)\s+"[^"]+"\s+does not exist', re.I),
-        source="cyrilgdn/postgresql provider (undefined_object) — platform-resources path",
-    ),
-    _ImportFailureSignature(
-        outcome=_ImportOutcome.NOT_FOUND,
-        pattern=re.compile(r"\(42704\)", re.I),
-        source="cyrilgdn/postgresql provider (undefined_object SQLSTATE) — platform-resources path",
-    ),
-    _ImportFailureSignature(
-        outcome=_ImportOutcome.NOT_FOUND,
-        pattern=re.compile(r"no secret found at", re.I),
-        source="hashicorp/vault provider (KV-v2 read) — platform-resources path",
+        source=(
+            "cyrilgdn/terraform-provider-postgresql@v1.22.0 "
+            'resource_postgresql_role.go:436-437 (`case err == sql.ErrNoRows: '
+            'log.Printf("[WARN] PostgreSQL ROLE (%s) not found")`) and '
+            "resource_postgresql_database.go:313-314 (identical shape) — kept "
+            "defensively (see the round-3 provenance paragraph above this table): "
+            "both branches actually swallow to `d.SetId(\"\")` + nil, the same "
+            "soft-not-found shape covered by the terraform-core row above, so this "
+            "un-parenthesised text is not currently confirmed reachable via "
+            "`terraform import postgresql_role`/`postgresql_database` either"
+        ),
     ),
     _ImportFailureSignature(
         outcome=_ImportOutcome.NOT_FOUND,
