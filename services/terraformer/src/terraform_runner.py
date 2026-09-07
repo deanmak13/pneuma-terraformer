@@ -1186,10 +1186,12 @@ class TerraformRunner:
         # — env-only, never argv, so they never appear in a process
         # listing or the redacted argv log line above.
         env.update(self._provider_env())
-        # Per-call overrides — used exactly once today: apply_platform_auth
-        # injects a transient break-glass VAULT_TOKEN for its own single
-        # apply, without ever folding that token into _provider_env()
-        # (which every other terraform invocation on this runner shares).
+        # Per-call overrides — used twice today: apply_platform_auth injects
+        # a transient break-glass root VAULT_TOKEN for its own single
+        # apply, and plan_platform_auth injects a transient kubernetes-
+        # auth-minted VAULT_TOKEN for its currency-proof plan — neither
+        # ever folded into _provider_env() (which every other terraform
+        # invocation on this runner shares).
         if extra_env:
             env.update(extra_env)
 
@@ -2466,6 +2468,46 @@ class TerraformRunner:
                 return result
             finally:
                 self._wipe_tfvars(workdir)
+
+    async def plan_platform_auth(self, token: str, timeout: int = 120) -> int:
+        """Currency proof for openbao_bootstrap.ensure_platform_auth.
+
+        Runs `terraform plan -detailed-exitcode` against the SAME
+        platform-auth-bootstrap harness, the SAME persisted backend
+        (platform/auth-bootstrap/<env>.tfstate) and the SAME tfvars
+        apply_platform_auth uses, under a token the CALLER minted from the
+        pod's own kubernetes-auth login — never a root token, never a
+        stored one. Returns terraform's detailed exit code verbatim:
+          0 = no drift, the live policy/role match the baked harness
+          2 = drift, the caller must break glass and apply
+          1 = plan could not run at all (403 on the self-read grants, an
+              unreachable OpenBao, an HCL error) — NOT proof of currency;
+              the caller treats it exactly like drift.
+        Returns the code rather than raising: exit 2 is a NORMAL outcome
+        here, and TerraformError carries no way to say "drift, not failure".
+        An `init` failure still raises TerraformError (_init_platform_auth).
+        """
+        async with self._lock_for("_platform_auth"):
+            workdir = await self._ensure_platform_auth_workspace()
+            await self._init_platform_auth(workdir)
+            await self._platform_auth_tfvars_file(workdir)
+            try:
+                result = await self._spawn_once(
+                    workdir,
+                    ["plan", "-detailed-exitcode", "-input=false", "-no-color"],
+                    timeout,
+                    extra_env={"VAULT_TOKEN": token},
+                    failure_expected=True,
+                )
+            finally:
+                self._wipe_tfvars(workdir)
+        if result.exit_code not in (0, 2):
+            _LOG.warning(
+                "platform-auth currency plan could not run (exit=%s): %s",
+                result.exit_code,
+                _flatten_for_log(_scrub_secret_shaped(_tail(result.stderr or result.stdout))),
+            )
+        return result.exit_code
 
 
 _runner: TerraformRunner | None = None

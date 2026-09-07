@@ -2888,6 +2888,136 @@ async def test_apply_platform_auth_propagates_init_failure(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# plan_platform_auth — the currency proof openbao_bootstrap.ensure_platform_auth
+# runs on every boot BEFORE ever minting a break-glass root token: does the
+# live policy/role still match this baked harness? Unlike apply_platform_auth,
+# this goes through `_spawn_once` directly (not the retrying `_spawn`
+# wrapper) — exit 2 (drift) is a NORMAL outcome here and must never be
+# mistaken for a transient-conflict failure worth retrying.
+# ---------------------------------------------------------------------------
+
+
+def _platform_auth_settings(tmp_path: Path) -> Settings:
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    _seed_platform_auth_standalone(settings.terraform_standalone_root)
+    settings.terraform_workdir_root.mkdir(parents=True)
+    return settings
+
+
+@pytest.mark.asyncio
+async def test_plan_platform_auth_argv_and_backend(tmp_path: Path) -> None:
+    settings = _platform_auth_settings(tmp_path)
+    runner = TerraformRunner(settings)
+
+    init_calls: list[list[str]] = []
+    plan_calls: list[list[str]] = []
+    captured_tfvars: dict | None = None
+    plan_result = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+    init_result = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+
+    async def _fake_spawn_once(workdir, args, timeout, extra_env=None, **kwargs):  # noqa: ARG001
+        nonlocal captured_tfvars
+        if args[0] == "init":
+            init_calls.append(args)
+            return init_result
+        assert args[0] == "plan"
+        plan_calls.append(args)
+        captured_tfvars = json.loads((workdir / "terraform.tfvars.json").read_text())
+        return plan_result
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        code = await runner.plan_platform_auth("s.k8s-minted")
+
+    assert code == 0
+    assert len(plan_calls) == 1
+    plan_args = plan_calls[0]
+    for flag in ("plan", "-detailed-exitcode", "-input=false", "-no-color"):
+        assert flag in plan_args
+
+    assert len(init_calls) == 1
+    init_args = init_calls[0]
+    key = f"platform/auth-bootstrap/{settings.env}.tfstate"
+    assert "-backend-config" in init_args
+    idx = init_args.index("-backend-config")
+    assert f"key={key}" in init_args[idx:]
+
+    assert captured_tfvars == {
+        "pooled_namespace": settings.pneuma_namespace,
+        "vault_k8s_auth_mount": settings.vault_k8s_auth_mount,
+        "vault_k8s_auth_role": settings.vault_k8s_auth_role,
+        "terraformer_service_account_name": settings.terraformer_service_account_name,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [0, 2, 1])
+async def test_plan_platform_auth_maps_exit_codes(tmp_path: Path, exit_code: int) -> None:
+    """0 (clean), 2 (drift), and 1 (plan could not run) are all returned
+    verbatim — never raised as a TerraformError. Only `init` failing raises;
+    the plan step's own non-zero exits are the caller's normal signal."""
+    settings = _platform_auth_settings(tmp_path)
+    runner = TerraformRunner(settings)
+
+    init_result = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+    plan_result = TerraformResult(
+        exit_code=exit_code, stdout="", stderr="", outputs={},
+    )
+
+    async def _fake_spawn_once(workdir, args, timeout, extra_env=None, **kwargs):  # noqa: ARG001
+        return init_result if args[0] == "init" else plan_result
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        code = await runner.plan_platform_auth("s.k8s-minted")
+
+    assert code == exit_code
+
+
+@pytest.mark.asyncio
+async def test_plan_platform_auth_injects_token_for_plan_only_and_wipes_tfvars(
+    tmp_path: Path,
+) -> None:
+    settings = _platform_auth_settings(tmp_path)
+    runner = TerraformRunner(settings)
+    tfvars_path = settings.terraform_workdir_root / "_platform_auth" / "terraform.tfvars.json"
+
+    captured_extra_env: list[dict[str, str] | None] = []
+    init_result = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+    plan_clean = TerraformResult(exit_code=0, stdout="", stderr="", outputs={})
+
+    async def _fake_spawn_once(workdir, args, timeout, extra_env=None, **kwargs):  # noqa: ARG001
+        captured_extra_env.append(extra_env)
+        return init_result if args[0] == "init" else plan_clean
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        code = await runner.plan_platform_auth("s.k8s-minted")
+
+    assert code == 0
+    assert len(captured_extra_env) == 2, "expected init then plan"
+    init_env, plan_env = captured_extra_env
+    assert init_env is None
+    assert plan_env == {"VAULT_TOKEN": "s.k8s-minted"}
+    assert "VAULT_TOKEN" not in runner._provider_env()
+    assert not tfvars_path.exists(), "tfvars must be wiped after a clean plan"
+
+    # And on a plan that could not run at all (exit 1) — still wiped.
+    plan_broken = TerraformResult(exit_code=1, stdout="", stderr="403 permission denied", outputs={})
+
+    async def _fake_spawn_once_broken(workdir, args, timeout, extra_env=None, **kwargs):  # noqa: ARG001
+        return init_result if args[0] == "init" else plan_broken
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once_broken)):
+        code = await runner.plan_platform_auth("s.k8s-minted")
+
+    assert code == 1
+    assert not tfvars_path.exists(), "tfvars must be wiped even when the plan could not run"
+
+
+# ---------------------------------------------------------------------------
 # Transient infrastructure-provider conflict retry (fix/transient-conflict-
 # retry) — bounded retry for the live 2026-07-29 failure: two concurrent
 # tenant applies (max_concurrent_terraform_runs stays > 1 on purpose) both

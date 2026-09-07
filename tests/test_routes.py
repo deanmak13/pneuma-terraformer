@@ -151,7 +151,7 @@ def test_bootstrap_openbao_auth_requires_admin_key(client: TestClient) -> None:
 def test_bootstrap_openbao_auth_returns_action(client: TestClient) -> None:
     with patch(
         "services.terraformer.src.routes.provisioning.ensure_platform_auth",
-        AsyncMock(return_value="noop_role_already_valid"),
+        AsyncMock(return_value="noop_role_and_policy_current"),
     ):
         resp = client.post(
             "/provisioning/admin/bootstrap/openbao-auth",
@@ -159,7 +159,7 @@ def test_bootstrap_openbao_auth_returns_action(client: TestClient) -> None:
         )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["action"] == "noop_role_already_valid"
+    assert body["action"] == "noop_role_and_policy_current"
     assert body["role"] and body["mount"]
 
 
