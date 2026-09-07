@@ -4464,8 +4464,24 @@ class _FakeTerraform:
             # `Error()` never appends a SQLSTATE code, parenthesised or
             # otherwise, to any `pq:`-prefixed text). Any `(SQLSTATE ...)`
             # suffix, real or not, is irrelevant to this row's match.
+            # NOTE: this fixture still carries `pq:`, so it does NOT
+            # isolate the deletion (the `pq:` row matches it with or
+            # without the dropped row) — see the `pq:`-free case below
+            # for the actual RED proof.
             'pq: role "activepieces_app" does not exist (SQLSTATE 42704)',
             runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            # Round-1 review Important 1 — the actual isolating RED proof
+            # for the dropped `(42704)` row's deletion: this text carries
+            # the SQLSTATE-shaped `(42704)` code WITHOUT the `pq:` phrase,
+            # so the surviving `pq:` row's regex (which requires a literal
+            # `pq:` prefix) cannot match it either. Pre-fix (with the
+            # `(42704)` row still registered) this text was NOT_FOUND;
+            # post-fix, with no row left to match it, it is UNCLASSIFIED
+            # (LAW: unknown is not benign).
+            "Error: importing role failed (42704)",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
         ),
         (
             "Error: NoSuchBucket: The specified bucket does not exist",
@@ -4556,7 +4572,7 @@ class _FakeTerraform:
             # dropped, not registered. The real vault text is `secret (%s)
             # not found, removing from state`
             # (hashicorp/terraform-provider-vault@v4.8.0
-            # vault/resource_kv_secret_v2.go:281-283), which this bare
+            # vault/resource_kv_secret_v2.go:281-284), which this bare
             # substring never matches, and even that real text can never
             # reach `terraform import` output for `vault_kv_secret_v2` (see
             # the round-2 provenance paragraph's drop rationale).
@@ -4572,7 +4588,7 @@ class _FakeTerraform:
             # above already established the real mechanism —
             # `vault_kv_secret_v2` uses the identical passthrough Importer
             # as postgresql_role/rabbitmq_vhost, so its genuine not-found
-            # (kvSecretV2Read's `secret == nil` branch, :279-283) swallows
+            # (kvSecretV2Read's `secret == nil` branch, :281-284) swallows
             # to `d.SetId(""); return nil` with no error text, landing on
             # the terraform-core row above instead. Pre-fix (with the
             # dropped row still registered) this text was NOT_FOUND — this

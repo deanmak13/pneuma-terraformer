@@ -480,13 +480,6 @@ class _PlatformResourcesImportEntry:
         return f"{_PLATFORM_RESOURCES_MODULE_ADDRESS}.{self.module_address}"
 
 
-# Mirrors pneuma-deployments infrastructure/terraform/modules/platform-
-# resources/inter-service-hmac.tf's `local.inter_service_hmac_pairs` KEYS
-# exactly — that .tf file's own header comment already documents this
-# "kept in sync by inspection at PR time" convention against
-# services/common/rpc/service_pairs.py (pneuma-engine); this is the SAME
-# convention one level removed. Verified against pneuma-deployments
-# origin/main at authoring time (2026-08-19).
 def _kv_v2_import_id(mount: str, name: str) -> str:
     """The `terraform import` ID for a `vault_kv_secret_v2` resource —
     ONE derivation (LAW: design for N), used by every hmac entry below.
@@ -494,10 +487,10 @@ def _kv_v2_import_id(mount: str, name: str) -> str:
     hashicorp/terraform-provider-vault@v4.8.0's `vault_kv_secret_v2` uses
     the SDKv2 passthrough Importer (`schema.ImportStatePassthroughContext`,
     vault/resource_kv_secret_v2.go:54-55) — `d.Id()` becomes `path` verbatim,
-    then `kvSecretV2Read` (:238) parses `mount`/`name` back OUT of that
+    then `kvSecretV2Read` (:239) parses `mount`/`name` back OUT of that
     single string via `getKVV2SecretMountFromPath`/`getKVV2SecretNameFromPath`
     (:251,:256; error text "unable to read mount from ID %s, err=%s" at
-    :253). Those helpers (:403-415) match `path` against
+    :253). Those helpers (:392-412) match `path` against
     `kvV2SecretMountFromPathRegex = regexp.MustCompile("^(.+?)/data/.+$")`
     (:24) — the regex REQUIRES a literal `/data/` segment; on no match,
     `getKVV2SecretMountFromPath` returns the sentinel `fmt.Errorf("no mount
@@ -524,7 +517,7 @@ def _kv_v2_import_id(mount: str, name: str) -> str:
 
     A genuine not-found (a well-formed `<mount>/data/<name>` ID pointing at
     a secret that truly does not exist in Vault) is a DIFFERENT code path —
-    `kvSecretV2Read`'s `secret == nil` branch (:279-283) swallows it into
+    `kvSecretV2Read`'s `secret == nil` branch (:281-284) swallows it into
     `d.SetId(""); return nil` (a WARN-level `log.Printf`, no error
     returned) — the exact same soft-not-found shape the round-1/round-2
     provenance paragraphs above `_IMPORT_FAILURE_SIGNATURES` already
@@ -535,6 +528,13 @@ def _kv_v2_import_id(mount: str, name: str) -> str:
     return f"{mount}/data/{name}"
 
 
+# Mirrors pneuma-deployments infrastructure/terraform/modules/platform-
+# resources/inter-service-hmac.tf's `local.inter_service_hmac_pairs` KEYS
+# exactly — that .tf file's own header comment already documents this
+# "kept in sync by inspection at PR time" convention against
+# services/common/rpc/service_pairs.py (pneuma-engine); this is the SAME
+# convention one level removed. Verified against pneuma-deployments
+# origin/main at authoring time (2026-08-19).
 _INTER_SERVICE_HMAC_PAIRS: tuple[str, ...] = (
     "brain-brain",
     "connector-gateway-agno",
@@ -888,7 +888,7 @@ class _ImportFailureSignature:
 # body "Round-2 fixes" table): the vault-KV-v2 `secret not found` row
 # (the real provider text is `secret (%s) not found, removing from
 # state` — hashicorp/terraform-provider-vault@v4.8.0
-# vault/resource_kv_secret_v2.go:281-283 — a WARN-level provider-plugin
+# vault/resource_kv_secret_v2.go:281-284 — a WARN-level provider-plugin
 # log line that never reaches import output without TF_LOG_PROVIDER, and
 # even with it, `vault_kv_secret_v2` (:54-55 of the same file) uses the
 # identical passthrough Importer as postgresql_role/rabbitmq_vhost above,
@@ -911,9 +911,9 @@ class _ImportFailureSignature:
 # v4.8.0 vault/resource_kv_secret_v2.go:54-55) uses the identical
 # passthrough Importer as postgresql_role/rabbitmq_vhost, and its Read
 # function's genuine not-found branch (`kvSecretV2Read`, secret == nil at
-# :279-283) swallows into `d.SetId(""); return nil` (a WARN `log.Printf`,
-# "secret (%s) not found, removing from state" — confirmed at :282, not
-# :281-283 as round-2 cited) with no error text at all — so a genuine
+# :281-284) swallows into `d.SetId(""); return nil` (a WARN `log.Printf`,
+# "secret (%s) not found, removing from state" at :282) with no error
+# text at all — so a genuine
 # not-found lands on the generic terraform-core "Cannot import
 # non-existent remote object" row above, exactly like postgresql_role/
 # rabbitmq. Nothing in the source produces "no secret found at" in any
@@ -939,9 +939,13 @@ class _ImportFailureSignature:
 # `pq: database "x" does not exist` is SQLSTATE 3D000 (`invalid_catalog_
 # name`, lib/pq error.go:231) — a fixed `(42704)` string would never have
 # matched the database case it was partly meant to cover. The
-# classification-table test now pins `does not exist (SQLSTATE 42704)`-
-# shaped text as classified by the `pq:` row alone (its regex has no
-# SQLSTATE clause) — the RED proof for the deletion.
+# `does not exist (SQLSTATE 42704)`-shaped classification-table fixtures
+# both still contain the `pq:` phrase, so they show the surviving `pq:`
+# row alone covers that shape (its regex has no SQLSTATE clause) — they
+# are NOT the deletion proof, since that row matches them identically
+# whether or not the dropped `(42704)` row exists. The isolating RED
+# proof is the `pq:`-free `(42704)` case below, which only the deleted
+# row ever matched.
 _IMPORT_FAILURE_SIGNATURES: tuple[_ImportFailureSignature, ...] = (
     _ImportFailureSignature(
         outcome=_ImportOutcome.ALREADY_MANAGED,
