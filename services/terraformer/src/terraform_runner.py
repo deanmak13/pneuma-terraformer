@@ -38,6 +38,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -453,11 +454,30 @@ class PlatformResourcesInputs:
     env: str  # dev | tst | prod
 
 
+# The platform-resources workspace's ROOT module is the standalone harness
+# (pneuma-deployments infrastructure/terraform/standalone/platform-resources-apply/
+# main.tf:123 `module "platform_resources" { source = "../../modules/platform-resources" }`,
+# baked into this image at /app/infrastructure/terraform/standalone/platform-resources-apply),
+# NOT modules/platform-resources itself — unlike the tenant workspace, which copies
+# modules/tenant/* AS its root (see _ensure_workspace). Every real address is therefore
+# module-qualified. ONE constant, applied by _PlatformResourcesImportEntry.resource_address
+# for every row (LAW: design for N) — never a per-row string edit.
+_PLATFORM_RESOURCES_MODULE_ADDRESS = "module.platform_resources"
+
+
 @dataclass(frozen=True)
 class _PlatformResourcesImportEntry:
     name: str
-    resource_address: str
+    # Module-RELATIVE address, exactly as declared in modules/platform-
+    # resources/*.tf (mirrors the .tf declaration, not the real terraform
+    # address). `.resource_address` below derives the real, module-
+    # qualified address every call site actually uses.
+    module_address: str
     resource_id: str
+
+    @property
+    def resource_address(self) -> str:
+        return f"{_PLATFORM_RESOURCES_MODULE_ADDRESS}.{self.module_address}"
 
 
 # Mirrors pneuma-deployments infrastructure/terraform/modules/platform-
@@ -498,11 +518,24 @@ def _platform_resources_import_entries(env: str) -> tuple[_PlatformResourcesImpo
     currently used in any ID) for symmetry with the tenant registry's
     per-input callables and because a future entry may need it (this
     workspace IS env-scoped, unlike the tenant one which is per-tenant).
+
+    2026-08-19 → 2026-09-07: these addresses were declared ROOT-level and
+    NEVER matched a single real address. The workspace's root module is
+    the wrapper harness (main.tf:123), so every address is
+    `module.platform_resources.*`: `_state_addresses` matched nothing,
+    every `terraform import` failed with `resource address … does not
+    exist in the configuration`, and the swallow-everything failure
+    handling logged that at DEBUG as 'apply will create it'. The fix
+    shipped dead for 19 days; TST wedged on `pq: role "activepieces_app"
+    already exists (42710)` 2026-09-07 19:45Z (image
+    `sha-c79f263-tf45c1dcc`). Addresses are now derived from
+    `_PLATFORM_RESOURCES_MODULE_ADDRESS`, and an unclassified import
+    failure fails the reconcile closed.
     """
     entries = [
         _PlatformResourcesImportEntry(
             name="activepieces_app_role",
-            resource_address="postgresql_role.activepieces_app",
+            module_address="postgresql_role.activepieces_app",
             # Mirrors modules/platform-resources's `var.activepieces_
             # role_name` default ("activepieces_app") — the standalone
             # harness never overrides it. cyrilgdn/postgresql provider: a
@@ -513,7 +546,7 @@ def _platform_resources_import_entries(env: str) -> tuple[_PlatformResourcesImpo
         ),
         _PlatformResourcesImportEntry(
             name="activepieces_database",
-            resource_address="postgresql_database.activepieces",
+            module_address="postgresql_database.activepieces",
             # Mirrors `var.activepieces_database` default ("activepieces").
             # Same CREATE-ONLY failure class as the role (postgres.tf
             # documents this module CREATEs the database declaratively —
@@ -528,7 +561,7 @@ def _platform_resources_import_entries(env: str) -> tuple[_PlatformResourcesImpo
         entries.append(
             _PlatformResourcesImportEntry(
                 name=f"inter_service_hmac_{pair}",
-                resource_address=f'vault_kv_secret_v2.inter_service_hmac["{pair}"]',
+                module_address=f'vault_kv_secret_v2.inter_service_hmac["{pair}"]',
                 # hashicorp/vault provider: a vault_kv_secret_v2's import
                 # ID is "<mount>/<path>" (the bare KV-v2 logical path, NOT
                 # the "/data/" HTTP-API form used elsewhere in this file
@@ -673,6 +706,107 @@ class TerraformError(RuntimeError):
         snippet = _tail(result.stderr) or _tail(result.stdout)
         snippet = _scrub_secret_shaped(snippet)
         super().__init__(f"terraform {command} failed (exit={result.exit_code}): {snippet}")
+
+
+class _ImportOutcome(Enum):
+    """Result of classifying a `terraform import` failure — shared by
+    BOTH `_import_preexisting_platform_resources` and `_import_
+    preexisting_resources` (LAW: design for N — one enum, one table, one
+    classifier; never a per-call-site if-chain on stderr text)."""
+
+    ADOPTED = "adopted"
+    ALREADY_MANAGED = "already_managed"
+    NOT_FOUND = "not_found"
+    UNCLASSIFIED = "unclassified"
+
+
+@dataclass(frozen=True)
+class _ImportFailureSignature:
+    outcome: _ImportOutcome
+    pattern: re.Pattern[str]
+    source: str  # which tool/provider emits this text — provenance for every row
+
+
+# Registered `terraform import` failure texts, scanned in order against
+# `f"{result.stderr}\n{result.stdout}"`. Deliberately has NO catch-all row:
+# anything that matches nothing here is _ImportOutcome.UNCLASSIFIED, which
+# `_classify_import_failure`'s callers treat as a hard failure (LAW:
+# unknown is not benign). Explicitly covered by that default (never add a
+# row for these): `resource address "…" does not exist in the
+# configuration` / `Cannot import to nonexistent module` (THE live
+# 2026-08-19→2026-09-07 defect — root-level addresses in a module-rooted
+# workspace), `dial tcp … connection refused`, `password authentication
+# failed`, `permission denied`/`403`, `Error acquiring the state lock`.
+_IMPORT_FAILURE_SIGNATURES: tuple[_ImportFailureSignature, ...] = (
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.ALREADY_MANAGED,
+        pattern=re.compile(r"resource already managed by terraform", re.I),
+        source="terraform core `import` (address already in state; `state list` raced/failed)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"cannot import non-existent remote object", re.I),
+        source="terraform core `import` (terminal message when a provider Read finds no object)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r'pq:\s+(role|database|schema)\s+"[^"]+"\s+does not exist', re.I),
+        source="cyrilgdn/postgresql provider (undefined_object)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"\(42704\)", re.I),
+        source="cyrilgdn/postgresql provider (undefined_object SQLSTATE)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"no secret found at", re.I),
+        source="hashicorp/vault provider (KV-v2 read)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"secret not found", re.I),
+        source="hashicorp/vault provider (KV-v2 read)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"the specified bucket does not exist", re.I),
+        source="minio provider (S3 HeadBucket, tenant path)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"nosuchbucket", re.I),
+        source="minio provider (S3 error code, tenant path)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r'serviceaccounts "[^"]+" not found', re.I),
+        source="terraform-provider-kubernetes (ServiceAccount GET 404, tenant path)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"object not found", re.I),
+        source="cyrilgdn/rabbitmq provider (tenant path)",
+    ),
+    _ImportFailureSignature(
+        outcome=_ImportOutcome.NOT_FOUND,
+        pattern=re.compile(r"error 404", re.I),
+        source="cyrilgdn/rabbitmq provider (HTTP 404, tenant path)",
+    ),
+)
+
+
+def _classify_import_failure(result: TerraformResult) -> _ImportOutcome:
+    """Classify a non-zero `terraform import` result against
+    `_IMPORT_FAILURE_SIGNATURES`. Returns the first matching signature's
+    outcome, else `_ImportOutcome.UNCLASSIFIED` — there is no catch-all
+    row, so an error text nobody has registered is UNCLASSIFIED by
+    construction, never silently folded into NOT_FOUND."""
+    haystack = f"{result.stderr}\n{result.stdout}"
+    for signature in _IMPORT_FAILURE_SIGNATURES:
+        if signature.pattern.search(haystack):
+            return signature.outcome
+    return _ImportOutcome.UNCLASSIFIED
 
 
 _SECRET_FIELDS = (
@@ -1130,6 +1264,9 @@ class TerraformRunner:
         # exists to flag a REAL apply/destroy failure, and firing it on
         # every fresh-tenant apply's expected "not found, will create"
         # import probes would bury the genuine signal in noise.
+        # failure_expected selects the LOG LEVEL only — outcome
+        # classification lives in `_classify_import_failure`; never infer
+        # benignness from this flag.
         cmd = [self._settings.terraform_binary, *args]
         # Redact any -backend-config=key=value pairs that carry secrets
         # before logging. Without this, every init logs the MinIO
@@ -1656,10 +1793,12 @@ class TerraformRunner:
     async def _import_preexisting_resources(self, workdir: Path, inputs: TenantInputs) -> None:
         """Re-apply-drift convergence (see _IMPORT_ON_EXISTS_RESOURCES):
         for every registered resource not already in this workspace's
-        state, attempt `terraform import`. A provider that reports the ID
-        does NOT exist fails the import — that failure is swallowed here,
-        since it just means the upcoming `apply` will create the resource
-        fresh, exactly as before this fix. Only the ONE bulk state listing
+        state, attempt `terraform import`. Only a failure whose text
+        matches a registered provider/core does-not-exist signature is
+        swallowed here, since it just means the upcoming `apply` will
+        create the resource fresh, exactly as before this fix; anything
+        else is a programming/connectivity error and raises (LAW: unknown
+        is not benign). Only the ONE bulk state listing
         (`_state_addresses`) and this best-effort import run ahead of
         `apply`; nothing here can turn a real create-time error into a
         false convergence, because a genuine apply-time failure still
@@ -1682,11 +1821,27 @@ class TerraformRunner:
                     "— re-apply drift recovery",
                     entry.name, entry.resource_address, resource_id, inputs.tenant_id,
                 )
-            else:
+                continue
+            outcome = _classify_import_failure(result)
+            if outcome is _ImportOutcome.ALREADY_MANAGED:
+                _LOG.info(
+                    "tf import: %s (%s) already managed (%s) for tenant_id=%s — "
+                    "state list missed it; skipping",
+                    entry.name, entry.resource_address, resource_id, inputs.tenant_id,
+                )
+            elif outcome is _ImportOutcome.NOT_FOUND:
                 _LOG.debug(
                     "tf import: %s (%s=%s) not found for tenant_id=%s — apply will create it",
                     entry.name, entry.resource_address, resource_id, inputs.tenant_id,
                 )
+            else:
+                _LOG.error(
+                    "tf import: %s (%s=%s) failed with an UNCLASSIFIED error for "
+                    "tenant_id=%s — refusing to treat this as \"does not pre-exist\" "
+                    "(LAW: unknown is not benign)",
+                    entry.name, entry.resource_address, resource_id, inputs.tenant_id,
+                )
+                raise TerraformError("import", result)
 
     def _persist_last_apply_log(self, workdir: Path, command: str, result: TerraformResult) -> None:
         """Persist the full (scrubbed) combined stdout+stderr of the most
@@ -1717,8 +1872,8 @@ class TerraformRunner:
                     workdir = await self._ensure_workspace(inputs.tenant_id)
                     await self._init(workdir, inputs.tenant_id)
                     await self._tfvars_file(workdir, inputs)
-                    await self._import_preexisting_resources(workdir, inputs)
                     try:
+                        await self._import_preexisting_resources(workdir, inputs)
                         result = await self._spawn(
                             workdir,
                             ["apply", "-auto-approve", "-no-color", *self._module_var_files(workdir)],
@@ -2104,6 +2259,11 @@ class TerraformRunner:
         database import would fail on a connection/auth error rather than
         a genuine "does not exist" — silently defeating this fix for
         exactly the two resources it exists to cover.
+
+        Only a failure whose text matches a registered provider/core
+        does-not-exist signature is swallowed; anything else is a
+        programming/connectivity error and raises (LAW: unknown is not
+        benign).
         """
         existing = await self._state_addresses(workdir)
         extra_env = self._platform_resources_extra_env()
@@ -2123,12 +2283,29 @@ class TerraformRunner:
                     "platform-resources env=%s — re-apply drift recovery",
                     entry.name, entry.resource_address, entry.resource_id, env,
                 )
-            else:
+                continue
+            outcome = _classify_import_failure(result)
+            if outcome is _ImportOutcome.ALREADY_MANAGED:
+                _LOG.info(
+                    "tf import: %s (%s) already managed (%s) for platform-resources "
+                    "env=%s — state list missed it; skipping",
+                    entry.name, entry.resource_address, entry.resource_id, env,
+                )
+            elif outcome is _ImportOutcome.NOT_FOUND:
                 _LOG.debug(
                     "tf import: %s (%s=%s) not found for platform-resources env=%s "
                     "— apply will create it",
                     entry.name, entry.resource_address, entry.resource_id, env,
                 )
+            else:
+                _LOG.error(
+                    "tf import: %s (%s=%s) failed with an UNCLASSIFIED error for "
+                    "platform-resources env=%s — refusing to treat this as \"does not "
+                    "pre-exist\" (2026-09-07: root-level addresses made every import "
+                    "fail this way for 19 days, silently)",
+                    entry.name, entry.resource_address, entry.resource_id, env,
+                )
+                raise TerraformError("import", result)
 
     async def reconcile_platform_resources(
         self, inputs: "PlatformResourcesInputs"
@@ -2155,8 +2332,8 @@ class TerraformRunner:
             await self._init_platform_resources(workdir, env)
             await self._platform_resources_tfvars_file(workdir, inputs)
             extra_env = self._platform_resources_extra_env()
-            await self._import_preexisting_platform_resources(workdir, env)
             try:
+                await self._import_preexisting_platform_resources(workdir, env)
                 result = await self._spawn(
                     workdir,
                     ["apply", "-auto-approve", "-no-color"],
