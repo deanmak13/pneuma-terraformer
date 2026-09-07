@@ -189,12 +189,19 @@ async def _generate_root_token(settings: Settings, shares: list[str]) -> str:
     return token
 
 
-async def _revoke_token(settings: Settings, token: str) -> None:
-    """Best-effort revoke of the break-glass root token. Logged failures
-    here never re-raise: this always runs from a `finally`, and letting a
-    revoke failure mask the real apply outcome (success OR the original
-    apply exception) would be strictly worse than a live-until-TTL token
-    (token_ttl on generate-root defaults short) plus a loud log line."""
+async def _revoke_token(settings: Settings, token: str, label: str) -> None:
+    """Best-effort revoke of a transient token this module minted — either
+    the break-glass root token (label="break-glass root") or a
+    kubernetes-auth-minted client token spent on a single
+    plan_platform_auth call (label="kubernetes-auth client"). Logged
+    failures here never re-raise: this always runs from a `finally`, and
+    letting a revoke failure mask the real outcome (success OR the
+    original exception) would be strictly worse than a live-until-TTL
+    token plus a loud log line naming which token it was. Each token's
+    own TTL is set where it's minted, not here: the break-glass root
+    token's is whatever generate-root/decode-token issues; the
+    kubernetes-auth client token's is token_ttl=1200 on the
+    vault_kubernetes_auth_backend_role.terraformer role (harness main.tf)."""
     base_url = settings.vault_addr.rstrip("/")
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -204,15 +211,15 @@ async def _revoke_token(settings: Settings, token: str) -> None:
             )
         except httpx.HTTPError:
             _LOG.exception(
-                "revoke-self for the break-glass root token failed — it may "
-                "still be live until its own TTL expires"
+                "revoke-self for the %s token failed — it may still be live "
+                "until its own TTL expires", label,
             )
             return
     if resp.status_code not in (200, 204):
         _LOG.error(
-            "revoke-self for the break-glass root token returned HTTP %d — "
-            "it may still be live until its own TTL expires",
-            resp.status_code,
+            "revoke-self for the %s token returned HTTP %d — it may still "
+            "be live until its own TTL expires",
+            label, resp.status_code,
         )
 
 
@@ -233,7 +240,7 @@ async def ensure_platform_auth(settings: Settings, runner: TerraformRunner) -> B
         finally:
             # Unconditional: this k8s-auth token must not outlive the
             # single plan call it was minted for.
-            await _revoke_token(settings, token)
+            await _revoke_token(settings, token, label="kubernetes-auth client")
         if code == 0:
             _LOG.info(
                 "openbao kubernetes-auth role=%s mount=%s policy current "
@@ -265,7 +272,7 @@ async def ensure_platform_auth(settings: Settings, runner: TerraformRunner) -> B
     finally:
         # Unconditional: even if apply_platform_auth raised, the minted
         # root token must not outlive this function.
-        await _revoke_token(settings, root_token)
+        await _revoke_token(settings, root_token, label="break-glass root")
 
     jwt2 = k8s_api.read_own_sa_jwt()
     token2 = await _k8s_login(settings, jwt2)
@@ -277,7 +284,7 @@ async def ensure_platform_auth(settings: Settings, runner: TerraformRunner) -> B
     try:
         code2 = await runner.plan_platform_auth(token2)
     finally:
-        await _revoke_token(settings, token2)
+        await _revoke_token(settings, token2, label="kubernetes-auth client")
     if code2 != 0:
         raise PlatformAuthBootstrapError(
             f"openbao platform-auth for role={role!r} still reports "

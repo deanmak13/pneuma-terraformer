@@ -725,12 +725,21 @@ async def test_revoke_transport_failure_is_logged_not_raised(
     # The transport failure must not propagate — apply succeeded and the
     # role re-verifies (plan clean), so the overall converge still reports
     # success. Two revoke attempts now: the root token (apply) and the
-    # k8s-auth token (post-apply plan) — both fail the same way.
+    # k8s-auth token (post-apply plan) — both fail the same way, and each
+    # log line must name WHICH token via its label, not a generic
+    # "the break-glass root token" that no longer describes both callers.
     assert action == "break_glass_applied"
     assert revoke_route.call_count == 2
     assert any(
-        "revoke-self" in r.message and "failed" in r.message for r in caplog.records
-    ), "expected a loud log line noting the revoke failure"
+        "revoke-self" in r.message and "break-glass root" in r.message and "failed" in r.message
+        for r in caplog.records
+    ), "expected a loud log line noting the break-glass root token's revoke failure"
+    assert any(
+        "revoke-self" in r.message
+        and "kubernetes-auth client" in r.message
+        and "failed" in r.message
+        for r in caplog.records
+    ), "expected a loud log line noting the kubernetes-auth client token's revoke failure"
     # And no token value itself must ever leak into that log line.
     assert not any("root-token-xyz" in r.message for r in caplog.records)
     assert not any(_K8S_TOKEN in r.message for r in caplog.records)
