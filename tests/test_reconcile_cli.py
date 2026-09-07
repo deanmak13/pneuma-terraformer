@@ -32,7 +32,11 @@ class _FakeLease:
 
 
 class _RaisingRunner:
+    def __init__(self) -> None:
+        self.called = False
+
     async def reconcile_platform_resources(self, inputs: PlatformResourcesInputs):  # noqa: ANN201
+        self.called = True
         raise TerraformError(
             "import",
             TerraformResult(exit_code=1, stdout="", stderr="UNCLASSIFIED boom", outputs={}),
@@ -42,7 +46,18 @@ class _RaisingRunner:
 def test_platform_resources_import_failure_exits_1() -> None:
     """A TerraformError raised out of reconcile_platform_resources (the
     fail-closed path an UNCLASSIFIED import failure now takes) must
-    surface as CLI exit code 1 — never a silent 0."""
+    surface as CLI exit code 1 — never a silent 0.
+
+    Asserts `_RaisingRunner.called` (not just the exit code) so this test
+    cannot pass for the wrong reason: `reconcile_cli._run`/`_reconcile_
+    platform_resources` import `get_runner` LOCALLY (call-time, inside the
+    function body — see reconcile_cli.py), so patching the module
+    attribute at `services.terraformer.src.terraform_runner.get_runner`
+    only actually reaches production code if that late-binding import
+    resolves through the patched attribute; a return-code-only assertion
+    would pass just as well if the patch silently missed and some other
+    path produced exit 1."""
+    runner = _RaisingRunner()
     with patch(
         "services.terraformer.src.openbao_bootstrap.ensure_platform_auth",
         AsyncMock(return_value="noop"),
@@ -51,6 +66,7 @@ def test_platform_resources_import_failure_exits_1() -> None:
         lambda *args, **kwargs: _FakeLease(),  # noqa: ARG005
     ), patch(
         "services.terraformer.src.terraform_runner.get_runner",
-        lambda: _RaisingRunner(),
+        lambda: runner,
     ):
         assert reconcile_cli.main(["platform-resources", "--env=tst"]) == 1
+    assert runner.called is True

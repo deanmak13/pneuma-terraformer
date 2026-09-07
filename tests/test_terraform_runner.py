@@ -499,6 +499,23 @@ async def test_output_json_parses_outputs(tmp_path: Path) -> None:
     assert out == {"tenant_db_url": "postgres://...", "tenant_vhost": "/tenant-001"}
 
 
+@pytest.mark.asyncio
+async def test_output_json_swallows_malformed_json(tmp_path: Path) -> None:
+    """A `terraform output -json` that exits 0 but emits unparseable
+    stdout (e.g. truncated by an OOM-killed process) must not raise out
+    of `_output_json` — it logs and returns `{}`, same conservative
+    shape as the non-zero-exit branch above it."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    result = TerraformResult(exit_code=0, stdout="{not valid json", stderr="", outputs={})
+    with patch.object(runner, "_spawn", AsyncMock(return_value=result)):
+        out = await runner._output_json(workdir)
+    assert out == {}
+
+
 # ---------------------------------------------------------------------------
 # P3 — module bake + provider mirror + S3 backend + var-files + provider env
 # ---------------------------------------------------------------------------
@@ -3559,7 +3576,16 @@ async def test_tenant_unclassified_import_failure_raises(
 ) -> None:
     """A connectivity failure during the tenant import probe must not be
     swallowed as "does not pre-exist" (LAW: unknown is not benign) — only
-    a registered provider/core does-not-exist signature may be swallowed."""
+    a registered provider/core does-not-exist signature may be swallowed.
+
+    Round-1 C1 RED proof: the pre-fix ERROR line logged name/address/id/
+    env and NO failure text at all — the only line carrying terraform's
+    stderr was `_spawn_once`'s DEBUG-level `failure_expected` path, never
+    reaching production INFO. Assert the ERROR record's message actually
+    CONTAINS the failure text (not just that some ERROR record exists),
+    and that a secret-shaped value embedded in that same stderr — e.g. a
+    provider echoing back a generated password — is scrubbed before it
+    ever reaches the tail, never the raw value."""
     settings = get_settings()
     runner = TerraformRunner(settings)
     inputs = _stub_inputs()
@@ -3572,7 +3598,10 @@ async def test_tenant_unclassified_import_failure_raises(
         return TerraformResult(
             exit_code=1,
             stdout="",
-            stderr="dial tcp 10.0.0.5:5432: connect: connection refused",
+            stderr=(
+                "dial tcp 10.0.0.5:5432: connect: connection refused "
+                "password=hunter2supersecret"
+            ),
             outputs={},
         )
 
@@ -3581,7 +3610,12 @@ async def test_tenant_unclassified_import_failure_raises(
         with pytest.raises(TerraformError):
             await runner._import_preexisting_resources(workdir, inputs)
 
-    assert any(r.levelname == "ERROR" for r in caplog.records)
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert error_records
+    message = error_records[0].getMessage()
+    assert "connection refused" in message
+    assert "hunter2supersecret" not in message
+    assert "<REDACTED>" in message
 
 
 # ---------------------------------------------------------------------------
@@ -4269,6 +4303,7 @@ class _FakeTerraform:
         declared: set[str] | None = None,
         present_ids: dict[str, str] | None = None,
         state: frozenset[str] = frozenset(),
+        undeclared_stderr_suffix: str = "",
     ) -> None:
         self.declared = (
             declared
@@ -4282,6 +4317,12 @@ class _FakeTerraform:
         self.state = state
         self.calls: list[list[str]] = []
         self.extra_envs: list[dict[str, str] | None] = []
+        # Appended to the "undeclared address" branch's stderr below —
+        # lets a caller (see the C1 RED proof) prove a secret-shaped
+        # value embedded in terraform's own stderr is scrubbed before it
+        # reaches the ERROR log line, without perturbing every other
+        # test's exact stderr text.
+        self.undeclared_stderr_suffix = undeclared_stderr_suffix
 
     async def spawn_once(self, workdir, args, timeout, **kwargs):  # noqa: ARG002
         self.calls.append(args)
@@ -4304,6 +4345,7 @@ class _FakeTerraform:
                     "\n\nBefore importing this resource, please create its configuration in "
                     'the root module. For example:\n\nresource "postgresql_role" '
                     '"activepieces_app" {\n  # (resource arguments)\n}'
+                    f"{self.undeclared_stderr_suffix}"
                 ),
                 outputs={},
             )
@@ -4321,6 +4363,15 @@ class _FakeTerraform:
         )
 
 
+# Six `_IMPORT_ON_EXISTS_RESOURCES` tenant entries -> which row below
+# proves their genuine not-found text (see the provenance comment above
+# `_IMPORT_FAILURE_SIGNATURES` for the sourced WebFetch citations):
+#   tenant_media_bucket        -> "bucket name cannot be empty" row (NEW)
+#   tenant_reader_service_account -> "serviceaccounts ... not found" row
+#   tenant_app_role            -> "Cannot import non-existent remote object" row
+#   tenant_admin_role          -> "Cannot import non-existent remote object" row
+#   tenant_rmq_vhost           -> "Cannot import non-existent remote object" row
+#   tenant_rmq_user            -> "Cannot import non-existent remote object" row
 @pytest.mark.parametrize(
     "stderr,expected",
     [
@@ -4343,6 +4394,16 @@ class _FakeTerraform:
         ),
         (
             'Error: serviceaccounts "tenant-acme-reader" not found',
+            runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            # tenant_media_bucket's ACTUAL fresh-signup not-found text —
+            # sourced from aminueza/terraform-provider-minio@v2.4.3's custom
+            # Importer re-querying GetBucketPolicy with the now-empty id
+            # minioReadBucket() cleared, hitting minio-go@v7.0.63's
+            # client-side bucket-name validation (pkg/s3utils/utils.go:354)
+            # before any network call. See the registry provenance comment.
+            "Error: error importing Minio S3 bucket policy: Bucket name cannot be empty",
             runner_mod._ImportOutcome.NOT_FOUND,
         ),
         (
@@ -4369,6 +4430,34 @@ class _FakeTerraform:
         ),
         (
             "Error acquiring the state lock",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # I3 RED proof: an unrelated provider 404 (e.g. a rabbitmq
+            # management-plugin URL misconfiguration) must NOT be folded
+            # into NOT_FOUND now that the unanchored `object not found` /
+            # `error 404` rows are gone — cyrilgdn/rabbitmq's genuine
+            # not-found path never produces this text (see provenance
+            # comment: it lands on the generic terraform-core row above).
+            "Error: 404 page not found",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # I3's SHARPEST RED proof: these two exact substrings ARE what
+            # the two now-dropped rows matched verbatim (confirmed via a
+            # cp-swap: with the old `object not found` / `error 404` rows
+            # restored, `_classify_import_failure` returned NOT_FOUND for
+            # both of these texts; "Error: 404 page not found" above,
+            # despite reading similarly, never actually matched either old
+            # row's regex). Any provider text merely CONTAINING these
+            # words for an unrelated reason (a generic web-server 404, an
+            # unrelated "object not found" from some other resource type)
+            # must now fail closed instead of being silently swallowed.
+            "Error: object not found",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            "Some vhost error 404 occurred",
             runner_mod._ImportOutcome.UNCLASSIFIED,
         ),
     ],
@@ -4447,6 +4536,21 @@ def test_platform_resources_hmac_import_id_matches_vault_kv_convention() -> None
 
 
 @pytest.mark.asyncio
+async def test_init_platform_resources_raises_on_nonzero_exit() -> None:
+    """`_init_platform_resources` fails loud on a non-zero `terraform
+    init` — same fail-closed contract as every other `_init_*` variant
+    on this runner (state-backend auth/connectivity errors must never be
+    silently swallowed ahead of the import-then-apply sequence)."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    bad = TerraformResult(exit_code=1, stdout="", stderr="Error: no valid credential sources", outputs={})
+    with patch.object(runner, "_spawn", AsyncMock(return_value=bad)):
+        with pytest.raises(TerraformError):
+            await runner._init_platform_resources(Path("/tmp/unused-ws"), "tst")
+
+
+@pytest.mark.asyncio
 async def test_import_preexisting_platform_resources_skips_when_already_in_state(
     tmp_path: Path,
 ) -> None:
@@ -4511,13 +4615,23 @@ async def test_import_preexisting_platform_resources_rejects_undeclared_address(
     live 2026-08-19->2026-09-07 defect's failure shape (root-level
     addresses never matched the module-qualified configuration). That
     UNCLASSIFIED failure must raise, not be silently swallowed as "does
-    not pre-exist"."""
+    not pre-exist".
+
+    Round-1 C1 RED proof: the pre-fix ERROR line logged name/address/id/
+    env and NO failure text at all. Assert the ERROR record's message
+    actually CONTAINS the failure text, and that a secret-shaped value
+    embedded in terraform's own stderr (e.g. a provider echoing back a
+    generated password in a diagnostic) is scrubbed to <REDACTED> before
+    it reaches that line, never the raw value."""
     settings = get_settings()
     runner = TerraformRunner(settings)
     workdir = tmp_path / "ws"
     workdir.mkdir()
 
-    fake = _FakeTerraform(declared=set())  # nothing declared -> every address rejected
+    fake = _FakeTerraform(
+        declared=set(),  # nothing declared -> every address rejected
+        undeclared_stderr_suffix="\n\npassword=hunter2supersecret",
+    )
 
     with caplog.at_level("ERROR", logger="terraformer.terraform"), \
          patch.object(runner, "_spawn_once", AsyncMock(side_effect=fake.spawn_once)), \
@@ -4525,7 +4639,12 @@ async def test_import_preexisting_platform_resources_rejects_undeclared_address(
         with pytest.raises(TerraformError):
             await runner._import_preexisting_platform_resources(workdir, "tst")
 
-    assert any(r.levelname == "ERROR" for r in caplog.records)
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert error_records
+    message = error_records[0].getMessage()
+    assert "does not exist in the configuration" in message
+    assert "hunter2supersecret" not in message
+    assert "<REDACTED>" in message
 
 
 @pytest.mark.asyncio
