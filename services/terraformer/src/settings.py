@@ -154,8 +154,13 @@ class Settings(BaseSettings):
     #
     # ensure_platform_auth() converges the kubernetes-auth role above at
     # every boot instead of relying on a stored token (see the block
-    # comment above vault_k8s_auth_role for the incident this replaces).
-    # These fields are the Python-side surface it needs — distinct from
+    # comment above vault_k8s_auth_role for the incident this replaces),
+    # AND proves the role's POLICY is current with git on every boot via
+    # TerraformRunner.plan_platform_auth's `terraform plan
+    # -detailed-exitcode` — a successful login alone only proves the role
+    # exists, not that its attached policy matches what was last applied
+    # (see openbao_bootstrap's module docstring, INCIDENT 2). These fields
+    # are the Python-side surface it needs — distinct from
     # VAULT_ADDR, which stays a bare env var read by the Terraform vault
     # provider directly (see terraform_runner._provider_env's docstring on
     # why that one is deliberately NOT threaded through Settings). This

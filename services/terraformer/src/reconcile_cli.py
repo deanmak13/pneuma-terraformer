@@ -5,14 +5,19 @@ docs/standards/platform-secrets.md "Automated lifecycle").
 
 Runs IN the terraformer image, as a Kubernetes Job that reuses the
 terraformer ServiceAccount (so it inherits the exact same OpenBao
-kubernetes-auth identity `_ensure_openbao_auth` already proves at pod
+kubernetes-auth identity/policy `_ensure_openbao_auth` proves at pod
 startup — see openbao_bootstrap.ensure_platform_auth — never a second,
-job-scoped Vault role or a static token). This is a DIFFERENT invocation
-path from the gRPC ApplyPlatformSecrets/ApplyPlatformBusTopology RPCs
-(those are dispatched by the cycle-executor over the network for the
-operator-gated draft->active flip); this CLI calls TerraformRunner
-in-process for the periodic/on-merge reconcile, which needs no caller
-identity beyond "runs as the terraformer ServiceAccount".
+job-scoped Vault role or a static token). The CronJob does not INHERIT
+that pod's prior proof — it is a fresh container, so `_run` below
+re-proves independently by calling ensure_platform_auth itself on every
+invocation (login -> `terraform plan` currency check -> break-glass if
+needed), exactly like the long-running pod's own lifespan hook. This is a
+DIFFERENT invocation path from the gRPC ApplyPlatformSecrets/
+ApplyPlatformBusTopology RPCs (those are dispatched by the cycle-executor
+over the network for the operator-gated draft->active flip); this CLI
+calls TerraformRunner in-process for the periodic/on-merge reconcile,
+which needs no caller identity beyond "runs as the terraformer
+ServiceAccount".
 
 Usage:
     python -m services.terraformer.src.reconcile_cli platform-secrets --env=tst

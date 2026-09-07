@@ -1,7 +1,8 @@
-"""Terraformer bootstraps its own OpenBao authority at every boot.
+"""Terraformer bootstraps its own OpenBao authority AND proves that
+authority's policy is current with git, at every boot.
 
-INCIDENT: the terraformer's stored OPENBAO_ADMIN_TOKEN (the static
-VAULT_TOKEN retired in feat/openbao-k8s-auth) expired silently, and
+INCIDENT 1 (feat/openbao-k8s-auth): the terraformer's stored
+OPENBAO_ADMIN_TOKEN (the static VAULT_TOKEN) expired silently, and
 `auth/token/lookup-self` — which needs no policy at all — returned 403,
 meaning every tenant `apply` failed with `permission denied`. A stored,
 expirable credential is the failure class, not a particular expiry date;
@@ -10,21 +11,34 @@ vault_k8s_auth_mount and terraform_runner._vault_provider_hcl) removes it
 by having the pod exchange its own identity for a short-lived token on
 every terraform run.
 
-But that k8s-auth ROLE has to exist first, and creating it normally
-requires an OpenBao root token — which nobody can mint by hand in
-production (no host access, no operator terraform run: LAW
-platform-bootstrap-zero-touch). Per bootstrap-in-service-not-infra, the
-OWNING SERVICE converges its own auth dependency at startup, idempotently,
-on every boot, with the same function re-triggerable via an admin
-endpoint (POST /provisioning/admin/bootstrap/openbao-auth).
+INCIDENT 2 (2026-09-07, pneuma#669): the FIRST version of this module's
+converge flow treated a successful kubernetes-auth LOGIN as proof the
+role AND its policy were current, and returned early. Login only proves
+the role exists and trusts this ServiceAccount — it says nothing about
+whether the POLICY attached to that role matches what git declares. A
+policy amendment (e.g. the platform-secrets fan-out targets grant) landed
+in the standalone `platform-auth-bootstrap` harness and sat inert for 20
+days: every boot logged in fine, no-op'd, and never re-applied the
+amendment, because nothing ever re-ran `terraform plan` against the live
+policy. The CronJob's `lastSuccessfulTime` stayed empty the whole time.
 
 Converge flow (ensure_platform_auth), run on every boot:
 
-  (a) Try `POST {VAULT_ADDR}/v1/auth/kubernetes/login` with this pod's own
-      projected ServiceAccount JWT. Success means the role already exists
-      and is current — the steady state. No-op, return.
-  (b) On failure (cold start: the role doesn't exist yet), BREAK GLASS
-      in-process:
+  (a) Try `POST {VAULT_ADDR}/v1/auth/<mount>/login` with this pod's own
+      projected ServiceAccount JWT (see _k8s_login). A 200 carrying a
+      usable `auth.client_token` mints a short-lived kubernetes-auth
+      token; anything else (non-200, transport error, or a 200 with no
+      usable token — unknown is never benign) reports "cannot log in".
+  (b) If login minted a token, spend it PROVING currency, not merely
+      existence: run `terraform plan -detailed-exitcode` against the
+      SAME platform-auth-bootstrap harness apply_platform_auth applies
+      (TerraformRunner.plan_platform_auth). Exit 0 means the live
+      policy/role match git — the steady state, no-op, return. Exit 2
+      (drift) or anything else (the plan could not even run — e.g. this
+      identity's self-introspection grant itself went stale) both fall
+      through to break-glass: an identity whose currency cannot be
+      proven is not proven to work.
+  (c) BREAK GLASS in-process (cold start, drift, or an unprovable plan):
         1. Read the Shamir unseal shares from the k8s Secret named by
            settings.openbao_bootstrap_secret_name, in namespace
            settings.openbao_namespace (see k8s_api.py).
@@ -32,17 +46,23 @@ Converge flow (ensure_platform_auth), run on every boot:
            (/v1/sys/generate-root/attempt -> .../update per share ->
            /v1/sys/decode-token) to mint a ONE-SHOT root token.
         3. Apply the `platform-auth-bootstrap` standalone Terraform
-           harness through the existing TerraformRunner — creates
+           harness through the existing TerraformRunner — converges
            vault_policy.terraformer + vault_kubernetes_auth_backend_role.terraformer
-           (see TerraformRunner.apply_platform_auth for exactly what that
-           harness contains and where it's baked from).
+           to exactly what git declares (see TerraformRunner.
+           apply_platform_auth for exactly what that harness contains
+           and where it's baked from).
         4. Revoke the minted root token via `/v1/auth/token/revoke-self`
            in a `finally` — unconditionally, even if step 3 raised. The
            token is never written to disk, logged, or returned from any
            function in this module.
-  (c) Re-run step (a) to PROVE the role now works. If it still fails,
-      raise PlatformAuthBootstrapError — the pod must not start serving
-      traffic against an OpenBao identity it cannot prove works.
+  (d) Re-prove: login again AND plan again. BOTH must pass — a fresh
+      login with a plan exit other than 0 means the just-applied harness
+      still does not match what this pod can prove, and a failed login
+      means the role itself never came up. Either raises
+      PlatformAuthBootstrapError — the pod must not start serving traffic
+      against an OpenBao identity it cannot prove works. This is bounded
+      by construction: at most ONE root-token mint per call, no retry
+      loop — the re-proof either passes or the function raises.
 
 Decoding the root token via OpenBao's own `/v1/sys/decode-token` endpoint
 (rather than re-implementing the OTP XOR client-side) keeps this module
@@ -65,7 +85,7 @@ from services.terraformer.src.terraform_runner import TerraformRunner
 
 _LOG = logging.getLogger("terraformer.openbao_bootstrap")
 
-BootstrapAction = Literal["noop_role_already_valid", "break_glass_applied"]
+BootstrapAction = Literal["noop_role_and_policy_current", "break_glass_applied"]
 
 
 class PlatformAuthBootstrapError(RuntimeError):
@@ -73,14 +93,16 @@ class PlatformAuthBootstrapError(RuntimeError):
     even after applying the break-glass module. The pod must not start."""
 
 
-async def _k8s_login_ok(settings: Settings, jwt: str) -> bool:
-    """POST the kubernetes-auth login. True on 200 (role exists and is
-    current); False on any other status or transport failure — both mean
-    'cannot log in today', which is the one signal this function reports.
-    Never raises: a network hiccup here is handled by falling through to
-    the break-glass path, whose OWN calls will surface a clear error if
-    OpenBao itself is genuinely unreachable."""
-    url = f"{settings.vault_addr.rstrip('/')}/v1/auth/kubernetes/login"
+async def _k8s_login(settings: Settings, jwt: str) -> str | None:
+    """POST the kubernetes-auth login and return the minted client token
+    on success, else None. None means 'cannot log in today, or logged in
+    without a usable token' — both send the caller to break-glass. A 200
+    carrying no auth.client_token is NOT treated as success: an identity
+    whose token cannot be used cannot prove anything (unknown is never
+    benign). Never raises; a transport hiccup falls through to the
+    break-glass path, whose own calls surface a clear error if OpenBao is
+    genuinely unreachable."""
+    url = f"{settings.vault_addr.rstrip('/')}/v1/auth/{settings.vault_k8s_auth_mount}/login"
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(
@@ -89,8 +111,14 @@ async def _k8s_login_ok(settings: Settings, jwt: str) -> bool:
             )
         except httpx.HTTPError as exc:
             _LOG.warning("kubernetes-auth login probe could not reach OpenBao: %s", exc)
-            return False
-    return resp.status_code == 200
+            return None
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    return (body.get("auth") or {}).get("client_token") or None
 
 
 async def _read_unseal_shares(settings: Settings) -> list[str]:
@@ -189,22 +217,47 @@ async def _revoke_token(settings: Settings, token: str) -> None:
 
 
 async def ensure_platform_auth(settings: Settings, runner: TerraformRunner) -> BootstrapAction:
-    """Converge this pod's OpenBao kubernetes-auth identity. Idempotent —
-    safe (and cheap: one HTTP call) to call on every boot and from the
-    admin endpoint on demand."""
-    jwt = k8s_api.read_own_sa_jwt()
-    if await _k8s_login_ok(settings, jwt):
-        _LOG.info(
-            "openbao kubernetes-auth role=%s mount=%s already valid — no-op",
-            settings.vault_k8s_auth_role, settings.vault_k8s_auth_mount,
-        )
-        return "noop_role_already_valid"
+    """Converge this pod's OpenBao kubernetes-auth identity AND prove its
+    policy is current with git. Idempotent — safe to call on every boot
+    and from the admin endpoint on demand. Bounded: at most one
+    break-glass root-token mint per call, no in-process retry loop."""
+    role = settings.vault_k8s_auth_role
+    mount = settings.vault_k8s_auth_mount
 
-    _LOG.warning(
-        "openbao kubernetes-auth login failed for role=%s — breaking glass "
-        "in-process to (re)create it",
-        settings.vault_k8s_auth_role,
-    )
+    jwt = k8s_api.read_own_sa_jwt()
+    token = await _k8s_login(settings, jwt)
+
+    if token is not None:
+        try:
+            code = await runner.plan_platform_auth(token)
+        finally:
+            # Unconditional: this k8s-auth token must not outlive the
+            # single plan call it was minted for.
+            await _revoke_token(settings, token)
+        if code == 0:
+            _LOG.info(
+                "openbao kubernetes-auth role=%s mount=%s policy current "
+                "(plan clean) — no-op", role, mount,
+            )
+            return "noop_role_and_policy_current"
+        if code == 2:
+            _LOG.warning(
+                "openbao platform-auth DRIFT: `terraform plan` reports pending "
+                "changes to role=%s / its policy — breaking glass to converge",
+                role,
+            )
+        else:
+            _LOG.warning(
+                "openbao platform-auth currency CANNOT BE PROVEN (plan exit=%s) "
+                "for role=%s — an identity whose currency cannot be proven is "
+                "not proven to work; breaking glass to converge", code, role,
+            )
+    else:
+        _LOG.warning(
+            "openbao kubernetes-auth login failed for role=%s — breaking glass "
+            "in-process to (re)create it", role,
+        )
+
     shares = await _read_unseal_shares(settings)
     root_token = await _generate_root_token(settings, shares)
     try:
@@ -215,15 +268,26 @@ async def ensure_platform_auth(settings: Settings, runner: TerraformRunner) -> B
         await _revoke_token(settings, root_token)
 
     jwt2 = k8s_api.read_own_sa_jwt()
-    if not await _k8s_login_ok(settings, jwt2):
+    token2 = await _k8s_login(settings, jwt2)
+    if token2 is None:
         raise PlatformAuthBootstrapError(
-            f"openbao kubernetes-auth role={settings.vault_k8s_auth_role!r} "
-            "still fails login after applying platform-auth-bootstrap — "
-            "refusing to start."
+            f"openbao kubernetes-auth role={role!r} still fails login after "
+            "applying platform-auth-bootstrap — refusing to start."
+        )
+    try:
+        code2 = await runner.plan_platform_auth(token2)
+    finally:
+        await _revoke_token(settings, token2)
+    if code2 != 0:
+        raise PlatformAuthBootstrapError(
+            f"openbao platform-auth for role={role!r} still reports "
+            f"drift/unprovable currency (plan exit={code2}) after applying "
+            "platform-auth-bootstrap — refusing to start. NOT retried "
+            "in-process: a second identical apply cannot fix what the first "
+            "could not."
         )
     _LOG.info(
-        "openbao kubernetes-auth role=%s mount=%s (re)created via break-glass "
-        "and verified",
-        settings.vault_k8s_auth_role, settings.vault_k8s_auth_mount,
+        "openbao kubernetes-auth role=%s mount=%s converged via break-glass "
+        "and verified (login ok, plan clean)", role, mount,
     )
     return "break_glass_applied"
