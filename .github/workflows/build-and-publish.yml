@@ -73,7 +73,13 @@ env:
   # vault-side field names), the adaptive-evidence HMAC service pairs, and
   # #1654 (tenant-api->brain-api HMAC pair) — none of which the running
   # image can execute until this ref moves.
-  DEPLOYMENTS_REF: 4fd2e724be97767ba7e0f3463bf6a27c7e8a0f7d
+  #
+  # Bumped 2026-09-07 to pneuma-deployments 45c1dcc — the terraformer policy
+  # fix (create/update on pneuma/data/internal/+/+, self-introspection READ
+  # grants, skip_child_token on the harness provider). This PR's
+  # ensure_platform_auth PLANS that harness on every boot; baked against the
+  # old ref the plan would report perpetual drift and break glass forever.
+  DEPLOYMENTS_REF: 45c1dccb0e938d69b3ddc6de73355f4d17013eb2
 
 # An image is an artifact OF a commit — two commits are two images and
 # neither supersedes the other; deployments pin sha-<40>. ref-keyed
