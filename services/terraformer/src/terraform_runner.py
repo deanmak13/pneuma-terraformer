@@ -740,7 +740,12 @@ class _ImportFailureSignature:
 # configuration` / `Cannot import to nonexistent module` (THE live
 # 2026-08-19→2026-09-07 defect — root-level addresses in a module-rooted
 # workspace), `dial tcp … connection refused`, `password authentication
-# failed`, `permission denied`/`403`, `Error acquiring the state lock`.
+# failed`, `permission denied`/`403`, `Error acquiring the state lock`,
+# and (round-2 review — see the provenance paragraph below) the bare
+# `bucket name cannot be empty` text: minioReadBucket's downstream
+# `GetBucketPolicy(ctx, "")` call renders this SAME text once the bucket
+# id is cleared, for a genuine not-found AND for every other read failure
+# alike — text alone can never tell them apart, so it is never registered.
 #
 # Round-1-review provenance (2026-09-07, WebFetch against pinned provider
 # GitHub source — never from memory; see PR body "Round-1 fixes" table
@@ -765,6 +770,65 @@ class _ImportFailureSignature:
 # registered below. This is also why the previously-registered
 # `object not found` / `error 404` rabbitmq rows never matched anything
 # real (dropped — see the classification-table test for the RED proof).
+#
+# Round-2-review provenance (2026-09-08, same pinned sources, deeper this
+# time — see PR body "Round-2 fixes" table): round-1 registered `bucket
+# name cannot be empty` as NOT_FOUND for tenant_media_bucket, reasoning
+# it was minioReadBucket's terminal text once a genuine not-found clears
+# the id. Incomplete: minio/resource_minio_s3_bucket.go:155-158's
+# `found, err := ...BucketExists(ctx, d.Id()); if !found { log.Printf(
+# NewResourceErrorStr("unable to find bucket", d.Id(), err)); d.SetId("");
+# return nil }` takes that SAME branch — clears the id, swallows the
+# error, logs, returns nil — for ANY read failure where BucketExists
+# reports found=false, not only a genuine not-found. Per
+# github.com/minio/minio-go/v7@v7.0.63 api-stat.go:29-57, BucketExists()
+# returns `(false, nil)` ONLY when the HEAD response maps to its
+# NoSuchBucket code; every other failure (dial tcp refused, AccessDenied,
+# TLS) returns `(false, err)` with err non-nil — but minioReadBucket's
+# branch does not distinguish, so the downstream
+# `GetBucketPolicy(ctx, "")` call and its "Bucket name cannot be empty"
+# client-side-validation text (minio-go pkg/s3utils/utils.go:354,
+# wrapped by minio/import_minio_s3_buckets.go:19 as "error importing
+# Minio S3 bucket policy: %s") is byte-identical either way — removed
+# from the table below (see the UNCLASSIFIED-default note above).
+#
+# The one text that DOES distinguish the two cases is minioReadBucket's
+# own breadcrumb — the SAME log.Printf line, one line earlier, before the
+# id is cleared: `NewResourceErrorStr("unable to find bucket", d.Id(),
+# err)` (minio/error.go:10-22) renders `[FATAL] unable to find bucket
+# (<id>): %s`/`%v` of err — and Go's `%v` of a genuinely nil `error`
+# passed through an `interface{}` parameter prints literally `<nil>`
+# (case error: requires a non-nil concrete type; a real nil interface
+# falls to the `default: … %v` branch instead). A real read failure has a
+# non-nil err and renders ITS OWN text there — never `<nil>` — so
+# `unable to find bucket (...): <nil>` is not-found-specific by
+# construction, not by convention; no mixed-case row is needed because
+# this text can never co-occur with a different, genuinely-UNCLASSIFIED
+# outcome for the SAME import attempt (the only thing that can follow it
+# in that subprocess's output is the now-unregistered, therefore inert,
+# "Bucket name cannot be empty" text above). That breadcrumb is stdlib
+# `log.Printf` output at the provider-plugin layer, which terraform
+# normally never relays to CLI stdout/stderr — `_import_preexisting_
+# resources` now runs its import probes with `extra_env=
+# _IMPORT_PROBE_EXTRA_ENV` (`TF_LOG_PROVIDER=INFO`) specifically so this
+# line reaches the text `_classify_import_failure` scans; the platform-
+# resources import probe never touches minio, so it is left unchanged.
+#
+# Also dropped this round (no reachable source found for either — see PR
+# body "Round-2 fixes" table): the vault-KV-v2 `secret not found` row
+# (the real provider text is `secret (%s) not found, removing from
+# state` — hashicorp/terraform-provider-vault@v4.8.0
+# vault/resource_kv_secret_v2.go:281-283 — a WARN-level provider-plugin
+# log line that never reaches import output without TF_LOG_PROVIDER, and
+# even with it, `vault_kv_secret_v2` (:54-55 of the same file) uses the
+# identical passthrough Importer as postgresql_role/rabbitmq_vhost above,
+# so its genuine not-found lands on the terraform-core row, not this
+# text — the row was unreachable either way) and the minio `nosuchbucket`
+# row (github.com/minio/minio-go/v7@v7.0.63 api-error-response.go:88-95
+# `ErrorResponse.Error()` returns only the friendly `Message` field —
+# already covered by the `the specified bucket does not exist` row below
+# — the bare `NoSuchBucket` S3 error CODE is never part of that returned
+# string, so nothing this provider emits ever reaches this row's regex).
 _IMPORT_FAILURE_SIGNATURES: tuple[_ImportFailureSignature, ...] = (
     _ImportFailureSignature(
         outcome=_ImportOutcome.ALREADY_MANAGED,
@@ -803,23 +867,26 @@ _IMPORT_FAILURE_SIGNATURES: tuple[_ImportFailureSignature, ...] = (
     ),
     _ImportFailureSignature(
         outcome=_ImportOutcome.NOT_FOUND,
-        pattern=re.compile(r"secret not found", re.I),
-        source="hashicorp/vault provider (KV-v2 read) — platform-resources path",
-    ),
-    _ImportFailureSignature(
-        outcome=_ImportOutcome.NOT_FOUND,
-        pattern=re.compile(r"bucket name cannot be empty", re.I),
+        pattern=re.compile(r"unable to find bucket \([^)]*\): <nil>", re.I),
         source=(
-            "aminueza/terraform-provider-minio@v2.4.3 minio/import_minio_s3_buckets.go "
-            "resourceMinioS3BucketImportState() — its custom Importer calls "
-            "minioReadBucket() first, which on a genuinely non-existent bucket does "
-            "`d.SetId(\"\")` + returns no error (minio/resource_minio_s3_bucket.go:158); "
-            "the Importer then re-queries `conn.GetBucketPolicy(ctx, d.Id())` with that "
-            "now-EMPTY id, which fails bucket-name validation client-side before any "
-            "network call — github.com/minio/minio-go/v7@v7.0.63 pkg/s3utils/utils.go:354 "
-            "(wrapped by the provider as \"error importing Minio S3 bucket policy: %s\") — "
-            "the ACTUAL fresh-signup not-found text for tenant_media_bucket, distinct "
-            "from the `the specified bucket does not exist` / `nosuchbucket` rows below"
+            "aminueza/terraform-provider-minio@v2.4.3 "
+            "minio/resource_minio_s3_bucket.go:150-158 minioReadBucket() — `found, err "
+            ":= ...BucketExists(ctx, d.Id()); if !found { log.Printf(\"%s\", "
+            "NewResourceErrorStr(\"unable to find bucket\", d.Id(), err)); d.SetId(\"\"); "
+            "return nil }`, via minio/error.go:10-22 NewResourceError()'s `default: … %v` "
+            "branch. `%v` of a genuinely nil `error` (passed through NewResourceError's "
+            "`err interface{}` parameter) renders literally `<nil>`; any OTHER read "
+            "failure has a non-nil err and renders ITS OWN text there instead (the "
+            "`case error:` branch), never `<nil>`. err is nil here ONLY when "
+            "github.com/minio/minio-go/v7@v7.0.63 api-stat.go:29-57 BucketExists() maps "
+            "the HEAD response to its NoSuchBucket code (`return false, nil`) — every "
+            "other BucketExists failure (dial tcp refused, AccessDenied, TLS) returns "
+            "`(false, err)` with err non-nil. Requires TF_LOG_PROVIDER=INFO on the "
+            "import probe (`_IMPORT_PROBE_EXTRA_ENV`, see `_import_preexisting_"
+            "resources`) — this is stdlib log.Printf provider-plugin output terraform "
+            "otherwise never relays to CLI stdout/stderr. Replaces the round-1 "
+            "`bucket name cannot be empty` row (see the round-2 provenance paragraph "
+            "above for why that text was not-found-specific in appearance only)."
         ),
     ),
     _ImportFailureSignature(
@@ -830,14 +897,6 @@ _IMPORT_FAILURE_SIGNATURES: tuple[_ImportFailureSignature, ...] = (
             "message text) — kept defensively for other minio S3 call shapes than the "
             "GetBucketPolicy path above; not currently confirmed reachable via "
             "`terraform import minio_s3_bucket`"
-        ),
-    ),
-    _ImportFailureSignature(
-        outcome=_ImportOutcome.NOT_FOUND,
-        pattern=re.compile(r"nosuchbucket", re.I),
-        source=(
-            "minio S3-compatible error code NoSuchBucket — kept defensively, same "
-            "caveat as the row above"
         ),
     ),
     _ImportFailureSignature(
@@ -867,6 +926,19 @@ def _classify_import_failure(result: TerraformResult) -> _ImportOutcome:
         if signature.pattern.search(haystack):
             return signature.outcome
     return _ImportOutcome.UNCLASSIFIED
+
+
+# `extra_env` for `_import_preexisting_resources`'s per-resource
+# `terraform import` probes ONLY — never the `apply` step that follows,
+# and never the platform-resources probe (`_import_preexisting_platform_
+# resources`, which imports no minio resource). Raises the provider-
+# plugin log verbosity terraform relays to CLI stdout/stderr so
+# minioReadBucket's own not-found breadcrumb (the `unable to find bucket
+# (...): <nil>` row in `_IMPORT_FAILURE_SIGNATURES` — see the round-2
+# provenance paragraph above that table) actually reaches the text
+# `_classify_import_failure` scans; without it, this is stdlib
+# `log.Printf` output the provider-plugin layer never surfaces at all.
+_IMPORT_PROBE_EXTRA_ENV: dict[str, str] = {"TF_LOG_PROVIDER": "INFO"}
 
 
 _SECRET_FIELDS = (
@@ -1873,6 +1945,7 @@ class TerraformRunner:
                 workdir,
                 ["import", "-input=false", entry.resource_address, resource_id],
                 timeout=60,
+                extra_env=_IMPORT_PROBE_EXTRA_ENV,
                 failure_expected=True,
             )
             if result.exit_code == 0:

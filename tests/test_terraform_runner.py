@@ -3517,6 +3517,79 @@ async def test_import_preexisting_resources_swallows_not_found_and_lets_apply_cr
 
 
 @pytest.mark.asyncio
+async def test_import_preexisting_resources_probe_carries_tf_log_provider_env(
+    tmp_path: Path,
+) -> None:
+    """Round-3 RED proof (d): every per-resource import probe spawn must
+    carry `TF_LOG_PROVIDER=INFO` via `extra_env` (`_IMPORT_PROBE_EXTRA_ENV`)
+    — without it, minioReadBucket's not-found breadcrumb (a provider-plugin
+    `log.Printf` line) never reaches the text `_classify_import_failure`
+    scans (see the round-2 provenance paragraph above
+    `_IMPORT_FAILURE_SIGNATURES`). Fails on the pre-fix file: the old
+    `_spawn_once` call there passed no `extra_env` at all."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    probe_extra_envs: list[dict[str, str] | None] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        probe_extra_envs.append(kwargs.get("extra_env"))
+        return TerraformResult(
+            exit_code=1,
+            stdout="",
+            stderr="Error: Cannot import non-existent remote object",
+            outputs={},
+        )
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    assert probe_extra_envs, "expected at least one per-resource import probe"
+    for extra_env in probe_extra_envs:
+        assert extra_env is not None
+        assert extra_env.get("TF_LOG_PROVIDER") == "INFO"
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_bare_bucket_empty_text_raises_not_swallowed(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path,
+) -> None:
+    """Round-3 RED proof (b): under option A, the round-1/round-2 bare
+    `Bucket name cannot be empty` text is now UNCLASSIFIED — no registered
+    row can tell a genuine not-found from any other minio read failure by
+    this text alone (see the round-2 provenance paragraph above
+    `_IMPORT_FAILURE_SIGNATURES`). It must raise through the SAME existing
+    UNCLASSIFIED path every other unknown import failure uses (LAW: unknown
+    is not benign), logging a real record that names the cause — never
+    silently adopted, and never swallowed at DEBUG as NOT_FOUND the way
+    HEAD 24cf3cd's registered row did."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    bare_text = "Error: error importing Minio S3 bucket policy: Bucket name cannot be empty"
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        return TerraformResult(exit_code=1, stdout="", stderr=bare_text, outputs={})
+
+    with caplog.at_level("WARNING", logger="terraformer.terraform"), \
+         patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        with pytest.raises(TerraformError):
+            await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Bucket name cannot be empty" in m for m in messages)
+    assert any("UNCLASSIFIED" in m for m in messages)
+    assert not any("adopted" in m for m in messages)
+
+
+@pytest.mark.asyncio
 async def test_reconcile_attempts_import_before_apply() -> None:
     """Wiring check: reconcile() must run the import-on-exists step before
     dispatching `apply`, so a half-provisioned tenant converges instead of
@@ -4366,7 +4439,7 @@ class _FakeTerraform:
 # Six `_IMPORT_ON_EXISTS_RESOURCES` tenant entries -> which row below
 # proves their genuine not-found text (see the provenance comment above
 # `_IMPORT_FAILURE_SIGNATURES` for the sourced WebFetch citations):
-#   tenant_media_bucket        -> "bucket name cannot be empty" row (NEW)
+#   tenant_media_bucket        -> minioReadBucket breadcrumb row (round-2 fix)
 #   tenant_reader_service_account -> "serviceaccounts ... not found" row
 #   tenant_app_role            -> "Cannot import non-existent remote object" row
 #   tenant_admin_role          -> "Cannot import non-existent remote object" row
@@ -4397,13 +4470,15 @@ class _FakeTerraform:
             runner_mod._ImportOutcome.NOT_FOUND,
         ),
         (
-            # tenant_media_bucket's ACTUAL fresh-signup not-found text —
-            # sourced from aminueza/terraform-provider-minio@v2.4.3's custom
-            # Importer re-querying GetBucketPolicy with the now-empty id
-            # minioReadBucket() cleared, hitting minio-go@v7.0.63's
-            # client-side bucket-name validation (pkg/s3utils/utils.go:354)
-            # before any network call. See the registry provenance comment.
-            "Error: error importing Minio S3 bucket policy: Bucket name cannot be empty",
+            # Round-3 RED proof (c): tenant_media_bucket's ACTUAL
+            # fresh-signup not-found signal — minioReadBucket()'s own
+            # breadcrumb, ONE line before it clears the bucket id, where
+            # `%v` of a genuinely nil `err` renders literally `<nil>` (see
+            # the round-2 provenance paragraph above
+            # `_IMPORT_FAILURE_SIGNATURES`). Only reaches import output
+            # with TF_LOG_PROVIDER=INFO on the probe — see
+            # test_import_preexisting_resources_probe_carries_tf_log_provider_env.
+            "[FATAL] unable to find bucket (acme-tst-media): <nil>",
             runner_mod._ImportOutcome.NOT_FOUND,
         ),
         (
@@ -4458,6 +4533,38 @@ class _FakeTerraform:
         ),
         (
             "Some vhost error 404 occurred",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # Round-3 RED proof (a): the round-1/round-2 (HEAD 24cf3cd)
+            # minio row's bare terminal text, on its own, is indistinguishable
+            # from ANY other minio read failure (see the round-2 provenance
+            # paragraph above `_IMPORT_FAILURE_SIGNATURES`) — deliberately
+            # UNREGISTERED now, so it falls to UNCLASSIFIED (LAW: unknown is
+            # not benign). Pre-fix this was NOT_FOUND (swallowed at DEBUG).
+            "Error: error importing Minio S3 bucket policy: Bucket name cannot be empty",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # Round-3 Minor-2 RED proof: `secret not found` — sourced and
+            # dropped, not registered. The real vault text is `secret (%s)
+            # not found, removing from state`
+            # (hashicorp/terraform-provider-vault@v4.8.0
+            # vault/resource_kv_secret_v2.go:281-283), which this bare
+            # substring never matches, and even that real text can never
+            # reach `terraform import` output for `vault_kv_secret_v2` (see
+            # the round-2 provenance paragraph's drop rationale).
+            "Error: secret not found",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # Round-3 Minor-2 RED proof: `nosuchbucket` — sourced and
+            # dropped, not registered. minio-go's ErrorResponse.Error()
+            # (api-error-response.go:88-95) only ever returns the friendly
+            # `Message` field, already covered by the
+            # `the specified bucket does not exist` row above; the bare
+            # `NoSuchBucket` S3 error CODE is never part of that string.
+            "Error: NoSuchBucket",
             runner_mod._ImportOutcome.UNCLASSIFIED,
         ),
     ],
