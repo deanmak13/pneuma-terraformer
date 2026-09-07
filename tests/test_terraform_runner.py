@@ -8,6 +8,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -496,6 +497,23 @@ async def test_output_json_parses_outputs(tmp_path: Path) -> None:
     with patch.object(runner, "_spawn", AsyncMock(return_value=result)):
         out = await runner._output_json(workdir)
     assert out == {"tenant_db_url": "postgres://...", "tenant_vhost": "/tenant-001"}
+
+
+@pytest.mark.asyncio
+async def test_output_json_swallows_malformed_json(tmp_path: Path) -> None:
+    """A `terraform output -json` that exits 0 but emits unparseable
+    stdout (e.g. truncated by an OOM-killed process) must not raise out
+    of `_output_json` — it logs and returns `{}`, same conservative
+    shape as the non-zero-exit branch above it."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    result = TerraformResult(exit_code=0, stdout="{not valid json", stderr="", outputs={})
+    with patch.object(runner, "_spawn", AsyncMock(return_value=result)):
+        out = await runner._output_json(workdir)
+    assert out == {}
 
 
 # ---------------------------------------------------------------------------
@@ -3487,12 +3505,88 @@ async def test_import_preexisting_resources_swallows_not_found_and_lets_apply_cr
         if args[:2] == ["state", "list"]:
             return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
         return TerraformResult(
-            exit_code=1, stdout="", stderr="Cannot import non-existent object", outputs={},
+            exit_code=1,
+            stdout="",
+            stderr="Error: Cannot import non-existent remote object",
+            outputs={},
         )
 
     with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
         # Must not raise.
         await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_probe_carries_tf_log_provider_env(
+    tmp_path: Path,
+) -> None:
+    """Round-3 RED proof (d): every per-resource import probe spawn must
+    carry `TF_LOG_PROVIDER=INFO` via `extra_env` (`_IMPORT_PROBE_EXTRA_ENV`)
+    — without it, minioReadBucket's not-found breadcrumb (a provider-plugin
+    `log.Printf` line) never reaches the text `_classify_import_failure`
+    scans (see the round-2 provenance paragraph above
+    `_IMPORT_FAILURE_SIGNATURES`). Fails on the pre-fix file: the old
+    `_spawn_once` call there passed no `extra_env` at all."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    probe_extra_envs: list[dict[str, str] | None] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        probe_extra_envs.append(kwargs.get("extra_env"))
+        return TerraformResult(
+            exit_code=1,
+            stdout="",
+            stderr="Error: Cannot import non-existent remote object",
+            outputs={},
+        )
+
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    assert probe_extra_envs, "expected at least one per-resource import probe"
+    for extra_env in probe_extra_envs:
+        assert extra_env is not None
+        assert extra_env.get("TF_LOG_PROVIDER") == "INFO"
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_resources_bare_bucket_empty_text_raises_not_swallowed(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path,
+) -> None:
+    """Round-3 RED proof (b): under option A, the round-1/round-2 bare
+    `Bucket name cannot be empty` text is now UNCLASSIFIED — no registered
+    row can tell a genuine not-found from any other minio read failure by
+    this text alone (see the round-2 provenance paragraph above
+    `_IMPORT_FAILURE_SIGNATURES`). It must raise through the SAME existing
+    UNCLASSIFIED path every other unknown import failure uses (LAW: unknown
+    is not benign), logging a real record that names the cause — never
+    silently adopted, and never swallowed at DEBUG as NOT_FOUND the way
+    HEAD 24cf3cd's registered row did."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    bare_text = "Error: error importing Minio S3 bucket policy: Bucket name cannot be empty"
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        return TerraformResult(exit_code=1, stdout="", stderr=bare_text, outputs={})
+
+    with caplog.at_level("WARNING", logger="terraformer.terraform"), \
+         patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        with pytest.raises(TerraformError):
+            await runner._import_preexisting_resources(workdir, _stub_inputs())
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Bucket name cannot be empty" in m for m in messages)
+    assert any("UNCLASSIFIED" in m for m in messages)
+    assert not any("adopted" in m for m in messages)
 
 
 @pytest.mark.asyncio
@@ -3522,6 +3616,79 @@ async def test_reconcile_attempts_import_before_apply() -> None:
         await runner.reconcile(_stub_inputs())
 
     assert called["import"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_wipes_tenant_tfvars_when_import_raises() -> None:
+    """Both import calls used to run OUTSIDE the try/finally that wipes
+    tfvars (`:1720` vs `:1721-1740` pre-fix) — a raise there would leave
+    the tenant's credential-laden terraform.auto.tfvars.json on disk. The
+    import call is now INSIDE the try, so the finally still wipes it even
+    when import itself raises."""
+    settings = get_settings()
+    _seed_module(settings.terraform_modules_root)
+    runner = TerraformRunner(settings)
+    inputs = _stub_inputs()
+
+    async def _fake_import(workdir, inputs_):  # noqa: ARG001
+        raise TerraformError(
+            "import", TerraformResult(exit_code=1, stdout="", stderr="boom", outputs={}),
+        )
+
+    with patch.object(runner, "_import_preexisting_resources", AsyncMock(side_effect=_fake_import)):
+        with pytest.raises(TerraformError):
+            await runner.reconcile(inputs)
+
+    workdir = runner._workspace_dir(inputs.tenant_id)
+    assert not (workdir / "terraform.auto.tfvars.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_tenant_unclassified_import_failure_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A connectivity failure during the tenant import probe must not be
+    swallowed as "does not pre-exist" (LAW: unknown is not benign) — only
+    a registered provider/core does-not-exist signature may be swallowed.
+
+    Round-1 C1 RED proof: the pre-fix ERROR line logged name/address/id/
+    env and NO failure text at all — the only line carrying terraform's
+    stderr was `_spawn_once`'s DEBUG-level `failure_expected` path, never
+    reaching production INFO. Assert the ERROR record's message actually
+    CONTAINS the failure text (not just that some ERROR record exists),
+    and that a secret-shaped value embedded in that same stderr — e.g. a
+    provider echoing back a generated password — is scrubbed before it
+    ever reaches the tail, never the raw value."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    inputs = _stub_inputs()
+    workdir = Path(settings.terraform_workdir_root) / "ws-unclassified"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
+        return TerraformResult(
+            exit_code=1,
+            stdout="",
+            stderr=(
+                "dial tcp 10.0.0.5:5432: connect: connection refused "
+                "password=hunter2supersecret"
+            ),
+            outputs={},
+        )
+
+    with caplog.at_level("ERROR", logger="terraformer.terraform"), \
+         patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
+        with pytest.raises(TerraformError):
+            await runner._import_preexisting_resources(workdir, inputs)
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert error_records
+    message = error_records[0].getMessage()
+    assert "connection refused" in message
+    assert "hunter2supersecret" not in message
+    assert "<REDACTED>" in message
 
 
 # ---------------------------------------------------------------------------
@@ -3563,18 +3730,17 @@ async def test_import_preexisting_resources_covers_service_account_and_both_role
     workdir = tmp_path / "ws"
     workdir.mkdir()
 
-    imported: list[str] = []
+    inputs = _stub_inputs()
+    declared = {e.resource_address for e in runner_mod._IMPORT_ON_EXISTS_RESOURCES}
+    present_ids = {
+        e.resource_address: e.resource_id(inputs) for e in runner_mod._IMPORT_ON_EXISTS_RESOURCES
+    }
+    fake = _FakeTerraform(declared=declared, present_ids=present_ids)
 
-    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
-        if args[:2] == ["state", "list"]:
-            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
-        assert args[0] == "import"
-        imported.append(args[-2])
-        return TerraformResult(exit_code=0, stdout="Import successful!", stderr="", outputs={})
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=fake.spawn_once)):
+        await runner._import_preexisting_resources(workdir, inputs)
 
-    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)):
-        await runner._import_preexisting_resources(workdir, _stub_inputs())
-
+    imported = [c[-2] for c in fake.calls if c[0] == "import"]
     assert "kubernetes_service_account.tenant_reader" in imported
     assert "postgresql_role.tenant_app" in imported
     assert "postgresql_role.tenant_admin" in imported
@@ -4164,19 +4330,303 @@ async def test_reconcile_serializes_two_runner_instances_via_tenant_lease(
 # _import_preexisting_resources above), extended to this workspace's
 # CREATE-ONLY resources (the AP role, the AP database, and every
 # inter-service-HMAC pair KV secret).
+#
+# 2026-08-19 -> 2026-09-07 follow-up defect: every row above was declared
+# ROOT-level, but the platform-resources workspace's root module is the
+# standalone wrapper harness — every real address is module-qualified
+# (`module.platform_resources.*`). `_state_addresses` matched nothing and
+# every `terraform import` failed with "resource address ... does not
+# exist in the configuration", silently swallowed at DEBUG as "not
+# found" for 19 days. `_FakeTerraform` below models terraform's OWN
+# import-time address validation (an undeclared address hard-fails
+# BEFORE reaching the provider) so these tests catch a regression to
+# root-level addresses, not just a dataclass-level typo.
+
+_MODULE_DECLARED_ADDRESSES = (
+    "postgresql_role.activepieces_app",
+    "postgresql_database.activepieces",
+    "vault_kv_secret_v2.inter_service_hmac",
+)
+
+# Ground truth for the real deployed module block (pneuma-deployments
+# infrastructure/terraform/standalone/platform-resources-apply/main.tf:123
+# `module "platform_resources" { source = "../../modules/platform-resources" }`)
+# — a LITERAL, independent of `_PLATFORM_RESOURCES_MODULE_ADDRESS`. The
+# static recurrence-guard tests below assert against this literal, never
+# against the production constant: if a guard recomputed its own expected
+# value from the same constant it exists to police, a mutation that flips
+# that constant would flip the expectation right along with it and the
+# guard could never go red (tautological under the mutation proof).
+_EXPECTED_PLATFORM_RESOURCES_MODULE_ADDRESS = "module.platform_resources"
+
+_ADDR_INDEX_RE = re.compile(r"\[.*\]$")
+
+
+class _FakeTerraform:
+    """Shared `_spawn_once` double for every import-path test — models
+    terraform's OWN import-time address validation, not just this
+    module's dataclass bookkeeping. `declared` defaults to the platform-
+    resources module-qualified family (derived from the production
+    `_PLATFORM_RESOURCES_MODULE_ADDRESS` constant, so the double cannot
+    drift from the code under test); pass an explicit `declared` set for
+    the tenant (root-module) path."""
+
+    def __init__(
+        self,
+        declared: set[str] | None = None,
+        present_ids: dict[str, str] | None = None,
+        state: frozenset[str] = frozenset(),
+        undeclared_stderr_suffix: str = "",
+    ) -> None:
+        self.declared = (
+            declared
+            if declared is not None
+            else {
+                f"{runner_mod._PLATFORM_RESOURCES_MODULE_ADDRESS}.{a}"
+                for a in _MODULE_DECLARED_ADDRESSES
+            }
+        )
+        self.present_ids = present_ids or {}
+        self.state = state
+        self.calls: list[list[str]] = []
+        self.extra_envs: list[dict[str, str] | None] = []
+        # Appended to the "undeclared address" branch's stderr below —
+        # lets a caller (see the C1 RED proof) prove a secret-shaped
+        # value embedded in terraform's own stderr is scrubbed before it
+        # reaches the ERROR log line, without perturbing every other
+        # test's exact stderr text.
+        self.undeclared_stderr_suffix = undeclared_stderr_suffix
+
+    async def spawn_once(self, workdir, args, timeout, **kwargs):  # noqa: ARG002
+        self.calls.append(args)
+        self.extra_envs.append(kwargs.get("extra_env"))
+        if args[:2] == ["state", "list"]:
+            if not self.state:
+                return TerraformResult(exit_code=1, stdout="", stderr="No instances", outputs={})
+            return TerraformResult(
+                exit_code=0, stdout="\n".join(sorted(self.state)) + "\n", stderr="", outputs={},
+            )
+        assert args[0] == "import"
+        addr, resource_id = args[-2], args[-1]
+        base_addr = _ADDR_INDEX_RE.sub("", addr)
+        if base_addr not in self.declared:
+            return TerraformResult(
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    f'Error: resource address "{addr}" does not exist in the configuration.'
+                    "\n\nBefore importing this resource, please create its configuration in "
+                    'the root module. For example:\n\nresource "postgresql_role" '
+                    '"activepieces_app" {\n  # (resource arguments)\n}'
+                    f"{self.undeclared_stderr_suffix}"
+                ),
+                outputs={},
+            )
+        if self.present_ids.get(addr) == resource_id:
+            return TerraformResult(exit_code=0, stdout="Import successful!", stderr="", outputs={})
+        return TerraformResult(
+            exit_code=1,
+            stdout="",
+            stderr=(
+                "Error: Cannot import non-existent remote object\n\nWhile attempting to "
+                f'import an existing object to "{addr}", the provider detected that no '
+                "object exists with the given id."
+            ),
+            outputs={},
+        )
+
+
+# Six `_IMPORT_ON_EXISTS_RESOURCES` tenant entries -> which row below
+# proves their genuine not-found text (see the provenance comment above
+# `_IMPORT_FAILURE_SIGNATURES` for the sourced WebFetch citations):
+#   tenant_media_bucket        -> minioReadBucket breadcrumb row (round-2 fix)
+#   tenant_reader_service_account -> "serviceaccounts ... not found" row
+#   tenant_app_role            -> "Cannot import non-existent remote object" row
+#   tenant_admin_role          -> "Cannot import non-existent remote object" row
+#   tenant_rmq_vhost           -> "Cannot import non-existent remote object" row
+#   tenant_rmq_user            -> "Cannot import non-existent remote object" row
+@pytest.mark.parametrize(
+    "stderr,expected",
+    [
+        # NOT_FOUND — one representative text per registered provider/core source.
+        (
+            "Error: Cannot import non-existent remote object",
+            runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            'pq: role "activepieces_app" does not exist (42704)',
+            runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            "No secret found at pneuma/infra/inter-service-hmac/brain-brain",
+            runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            "Error: NoSuchBucket: The specified bucket does not exist",
+            runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            'Error: serviceaccounts "tenant-acme-reader" not found',
+            runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            # Round-3 RED proof (c): tenant_media_bucket's ACTUAL
+            # fresh-signup not-found signal — minioReadBucket()'s own
+            # breadcrumb, ONE line before it clears the bucket id, where
+            # `%v` of a genuinely nil `err` renders literally `<nil>` (see
+            # the round-2 provenance paragraph above
+            # `_IMPORT_FAILURE_SIGNATURES`). Only reaches import output
+            # with TF_LOG_PROVIDER=INFO on the probe — see
+            # test_import_preexisting_resources_probe_carries_tf_log_provider_env.
+            "[FATAL] unable to find bucket (acme-tst-media): <nil>",
+            runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            "Error: resource already managed by Terraform",
+            runner_mod._ImportOutcome.ALREADY_MANAGED,
+        ),
+        # UNCLASSIFIED — never folded into NOT_FOUND (LAW: unknown is not benign).
+        (
+            'Error: resource address "postgresql_role.activepieces_app" does not exist '
+            "in the configuration",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            "Error: Cannot import to nonexistent module",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            "dial tcp 10.0.0.5:5432: connect: connection refused",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            'pq: password authentication failed for user "tf"',
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            "Error acquiring the state lock",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # I3 RED proof: an unrelated provider 404 (e.g. a rabbitmq
+            # management-plugin URL misconfiguration) must NOT be folded
+            # into NOT_FOUND now that the unanchored `object not found` /
+            # `error 404` rows are gone — cyrilgdn/rabbitmq's genuine
+            # not-found path never produces this text (see provenance
+            # comment: it lands on the generic terraform-core row above).
+            "Error: 404 page not found",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # I3's SHARPEST RED proof: these two exact substrings ARE what
+            # the two now-dropped rows matched verbatim (confirmed via a
+            # cp-swap: with the old `object not found` / `error 404` rows
+            # restored, `_classify_import_failure` returned NOT_FOUND for
+            # both of these texts; "Error: 404 page not found" above,
+            # despite reading similarly, never actually matched either old
+            # row's regex). Any provider text merely CONTAINING these
+            # words for an unrelated reason (a generic web-server 404, an
+            # unrelated "object not found" from some other resource type)
+            # must now fail closed instead of being silently swallowed.
+            "Error: object not found",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            "Some vhost error 404 occurred",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # Round-3 RED proof (a): the round-1/round-2 (HEAD 24cf3cd)
+            # minio row's bare terminal text, on its own, is indistinguishable
+            # from ANY other minio read failure (see the round-2 provenance
+            # paragraph above `_IMPORT_FAILURE_SIGNATURES`) — deliberately
+            # UNREGISTERED now, so it falls to UNCLASSIFIED (LAW: unknown is
+            # not benign). Pre-fix this was NOT_FOUND (swallowed at DEBUG).
+            "Error: error importing Minio S3 bucket policy: Bucket name cannot be empty",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # Round-3 Minor-2 RED proof: `secret not found` — sourced and
+            # dropped, not registered. The real vault text is `secret (%s)
+            # not found, removing from state`
+            # (hashicorp/terraform-provider-vault@v4.8.0
+            # vault/resource_kv_secret_v2.go:281-283), which this bare
+            # substring never matches, and even that real text can never
+            # reach `terraform import` output for `vault_kv_secret_v2` (see
+            # the round-2 provenance paragraph's drop rationale).
+            "Error: secret not found",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # Round-3 Minor-2 RED proof: `nosuchbucket` — sourced and
+            # dropped, not registered. minio-go's ErrorResponse.Error()
+            # (api-error-response.go:88-95) only ever returns the friendly
+            # `Message` field, already covered by the
+            # `the specified bucket does not exist` row above; the bare
+            # `NoSuchBucket` S3 error CODE is never part of that string.
+            "Error: NoSuchBucket",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+    ],
+)
+def test_import_failure_classification_table(
+    stderr: str, expected: "runner_mod._ImportOutcome",
+) -> None:
+    result = TerraformResult(exit_code=1, stdout="", stderr=stderr, outputs={})
+    assert runner_mod._classify_import_failure(result) == expected
+
+
+def test_import_failure_signatures_have_no_catch_all() -> None:
+    result = TerraformResult(
+        exit_code=1, stdout="", stderr="totally unrelated failure text", outputs={},
+    )
+    assert runner_mod._classify_import_failure(result) is runner_mod._ImportOutcome.UNCLASSIFIED
+    for signature in runner_mod._IMPORT_FAILURE_SIGNATURES:
+        assert signature.source
+
+
+def test_platform_resources_addresses_are_module_qualified() -> None:
+    """Static recurrence guard for the 19-day-silent defect: every real
+    address must be module-qualified, never a bare root-module string.
+    Asserted against the file-local ground-truth literal, NOT
+    `_PLATFORM_RESOURCES_MODULE_ADDRESS` itself — otherwise a mutation
+    that flips the constant would flip this assertion's expectation
+    right along with it and the guard could never go red."""
+    entries = runner_mod._platform_resources_import_entries("tst")
+    for entry in entries:
+        assert entry.resource_address.startswith(
+            _EXPECTED_PLATFORM_RESOURCES_MODULE_ADDRESS + "."
+        )
+        base = _ADDR_INDEX_RE.sub("", entry.module_address)
+        assert base in _MODULE_DECLARED_ADDRESSES
+
+
+def test_tenant_import_addresses_are_root_module() -> None:
+    """Paired guard: the tenant workspace copies modules/tenant/* AS its
+    root (see _ensure_workspace) — its addresses must stay root-level,
+    pinning the asymmetry with the platform-resources workspace above."""
+    for entry in runner_mod._IMPORT_ON_EXISTS_RESOURCES:
+        assert not entry.resource_address.startswith("module.")
+
 
 def test_platform_resources_import_entries_cover_role_and_database() -> None:
+    # Expected keys are the ground-truth literal, not the production
+    # constant (see _EXPECTED_PLATFORM_RESOURCES_MODULE_ADDRESS) — this
+    # pins the actual deployed module name, so a regression to the wrong
+    # constant value fails this test instead of silently agreeing with it.
     entries = runner_mod._platform_resources_import_entries("tst")
     by_address = {e.resource_address: e.resource_id for e in entries}
-    assert by_address["postgresql_role.activepieces_app"] == "activepieces_app"
-    assert by_address["postgresql_database.activepieces"] == "activepieces"
+    prefix = _EXPECTED_PLATFORM_RESOURCES_MODULE_ADDRESS
+    assert by_address[f"{prefix}.postgresql_role.activepieces_app"] == "activepieces_app"
+    assert by_address[f"{prefix}.postgresql_database.activepieces"] == "activepieces"
 
 
 def test_platform_resources_import_entries_cover_every_hmac_pair() -> None:
     entries = runner_mod._platform_resources_import_entries("tst")
     addresses = {e.resource_address for e in entries}
+    prefix = _EXPECTED_PLATFORM_RESOURCES_MODULE_ADDRESS
     for pair in runner_mod._INTER_SERVICE_HMAC_PAIRS:
-        assert f'vault_kv_secret_v2.inter_service_hmac["{pair}"]' in addresses
+        assert f'{prefix}.vault_kv_secret_v2.inter_service_hmac["{pair}"]' in addresses
     # One row generates N addresses (design-for-N) — not a hardcoded
     # one-off for the single role the live incident hit.
     assert len(addresses) == 2 + len(runner_mod._INTER_SERVICE_HMAC_PAIRS)
@@ -4184,11 +4634,27 @@ def test_platform_resources_import_entries_cover_every_hmac_pair() -> None:
 
 def test_platform_resources_hmac_import_id_matches_vault_kv_convention() -> None:
     entries = runner_mod._platform_resources_import_entries("tst")
+    prefix = _EXPECTED_PLATFORM_RESOURCES_MODULE_ADDRESS
     entry = next(
         e for e in entries
-        if e.resource_address == 'vault_kv_secret_v2.inter_service_hmac["brain-brain"]'
+        if e.resource_address == f'{prefix}.vault_kv_secret_v2.inter_service_hmac["brain-brain"]'
     )
     assert entry.resource_id == "pneuma/infra/inter-service-hmac/brain-brain"
+
+
+@pytest.mark.asyncio
+async def test_init_platform_resources_raises_on_nonzero_exit() -> None:
+    """`_init_platform_resources` fails loud on a non-zero `terraform
+    init` — same fail-closed contract as every other `_init_*` variant
+    on this runner (state-backend auth/connectivity errors must never be
+    silently swallowed ahead of the import-then-apply sequence)."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+
+    bad = TerraformResult(exit_code=1, stdout="", stderr="Error: no valid credential sources", outputs={})
+    with patch.object(runner, "_spawn", AsyncMock(return_value=bad)):
+        with pytest.raises(TerraformError):
+            await runner._init_platform_resources(Path("/tmp/unused-ws"), "tst")
 
 
 @pytest.mark.asyncio
@@ -4200,22 +4666,16 @@ async def test_import_preexisting_platform_resources_skips_when_already_in_state
     workdir = tmp_path / "ws"
     workdir.mkdir()
 
-    all_addresses = "\n".join(
+    all_addresses = {
         e.resource_address for e in runner_mod._platform_resources_import_entries("tst")
-    )
-    calls: list[list[str]] = []
+    }
+    fake = _FakeTerraform(state=frozenset(all_addresses))
 
-    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
-        calls.append(args)
-        if args == ["state", "list"]:
-            return TerraformResult(exit_code=0, stdout=all_addresses + "\n", stderr="", outputs={})
-        raise AssertionError("import must not run when every resource is already in state")
-
-    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)), \
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=fake.spawn_once)), \
          patch.object(runner, "_platform_resources_extra_env", lambda: {}):
         await runner._import_preexisting_platform_resources(workdir, "tst")
 
-    assert calls == [["state", "list"]]
+    assert fake.calls == [["state", "list"]]
 
 
 @pytest.mark.asyncio
@@ -4223,60 +4683,139 @@ async def test_import_preexisting_platform_resources_adopts_pre_existing_role(
     tmp_path: Path,
 ) -> None:
     """The live defect: `activepieces_app` created by a prior partial
-    apply but never recorded in state must be imported with the exact ID
-    the module itself would compute (the role name)."""
+    apply but never recorded in state must be imported with the exact
+    module-qualified address and the ID the module itself would
+    compute (the role name)."""
     settings = get_settings()
     runner = TerraformRunner(settings)
     workdir = tmp_path / "ws"
     workdir.mkdir()
 
-    imported: list[list[str]] = []
+    role_addr = f"{runner_mod._PLATFORM_RESOURCES_MODULE_ADDRESS}.postgresql_role.activepieces_app"
+    fake = _FakeTerraform(present_ids={role_addr: "activepieces_app"})
 
-    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
-        if args[:2] == ["state", "list"]:
-            return TerraformResult(exit_code=1, stdout="", stderr="No instances", outputs={})
-        assert args[0] == "import"
-        # extra_env must be threaded through so the postgresql provider
-        # can actually authenticate the import call.
-        assert kwargs.get("extra_env") == {"TF_VAR_pg_host": "stub"}
-        imported.append(args)
-        return TerraformResult(exit_code=0, stdout="Import successful!", stderr="", outputs={})
-
-    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)), \
+    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=fake.spawn_once)), \
          patch.object(
              runner, "_platform_resources_extra_env", lambda: {"TF_VAR_pg_host": "stub"}
          ):
         await runner._import_preexisting_platform_resources(workdir, "tst")
 
-    role_imports = [a for a in imported if a[-2] == "postgresql_role.activepieces_app"]
-    assert role_imports == [
-        ["import", "-input=false", "postgresql_role.activepieces_app", "activepieces_app"],
+    role_calls = [
+        (args, env)
+        for args, env in zip(fake.calls, fake.extra_envs, strict=True)
+        if args[0] == "import" and args[-2] == role_addr
+    ]
+    # extra_env must be threaded through so the postgresql provider can
+    # actually authenticate the import call.
+    assert role_calls == [
+        (["import", "-input=false", role_addr, "activepieces_app"], {"TF_VAR_pg_host": "stub"}),
     ]
 
 
 @pytest.mark.asyncio
-async def test_import_preexisting_platform_resources_swallows_not_found(
-    tmp_path: Path,
+async def test_import_preexisting_platform_resources_rejects_undeclared_address(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A fresh cluster (nothing pre-exists): every import attempt fails
-    and must NOT raise — the subsequent `apply` creates everything fresh,
-    exactly as before this fix."""
+    """`_FakeTerraform` models terraform's own import-time address
+    validation: an address absent from the module's declared
+    configuration hard-fails BEFORE reaching the provider — exactly the
+    live 2026-08-19->2026-09-07 defect's failure shape (root-level
+    addresses never matched the module-qualified configuration). That
+    UNCLASSIFIED failure must raise, not be silently swallowed as "does
+    not pre-exist".
+
+    Round-1 C1 RED proof: the pre-fix ERROR line logged name/address/id/
+    env and NO failure text at all. Assert the ERROR record's message
+    actually CONTAINS the failure text, and that a secret-shaped value
+    embedded in terraform's own stderr (e.g. a provider echoing back a
+    generated password in a diagnostic) is scrubbed to <REDACTED> before
+    it reaches that line, never the raw value."""
     settings = get_settings()
     runner = TerraformRunner(settings)
     workdir = tmp_path / "ws"
     workdir.mkdir()
 
-    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
-        if args[:2] == ["state", "list"]:
-            return TerraformResult(exit_code=1, stdout="", stderr="", outputs={})
-        return TerraformResult(
-            exit_code=1, stdout="", stderr="Cannot import non-existent object", outputs={},
-        )
+    fake = _FakeTerraform(
+        declared=set(),  # nothing declared -> every address rejected
+        undeclared_stderr_suffix="\n\npassword=hunter2supersecret",
+    )
 
-    with patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)), \
+    with caplog.at_level("ERROR", logger="terraformer.terraform"), \
+         patch.object(runner, "_spawn_once", AsyncMock(side_effect=fake.spawn_once)), \
+         patch.object(runner, "_platform_resources_extra_env", lambda: {}):
+        with pytest.raises(TerraformError):
+            await runner._import_preexisting_platform_resources(workdir, "tst")
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert error_records
+    message = error_records[0].getMessage()
+    assert "does not exist in the configuration" in message
+    assert "hunter2supersecret" not in message
+    assert "<REDACTED>" in message
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_platform_resources_swallows_genuine_not_found(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fresh cluster (nothing pre-exists): every import attempt fails
+    with the provider's genuine not-found text and must NOT raise — the
+    subsequent `apply` creates everything fresh, exactly as before this
+    fix."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    fake = _FakeTerraform()  # every declared address, nothing present -> NOT_FOUND
+
+    with caplog.at_level("DEBUG", logger="terraformer.terraform"), \
+         patch.object(runner, "_spawn_once", AsyncMock(side_effect=fake.spawn_once)), \
          patch.object(runner, "_platform_resources_extra_env", lambda: {}):
         # Must not raise.
         await runner._import_preexisting_platform_resources(workdir, "tst")
+
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+    assert any(
+        r.levelname == "DEBUG" and "not found for platform-resources" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_import_preexisting_platform_resources_skips_already_managed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`resource already managed by terraform` (state list raced/missed
+    it) must not raise, logs at INFO, and the loop continues to every
+    remaining entry rather than stopping."""
+    settings = get_settings()
+    runner = TerraformRunner(settings)
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    calls: list[list[str]] = []
+
+    async def _fake_spawn_once(workdir_, args, timeout, **kwargs):  # noqa: ARG001
+        calls.append(args)
+        if args[:2] == ["state", "list"]:
+            return TerraformResult(exit_code=1, stdout="", stderr="No instances", outputs={})
+        return TerraformResult(
+            exit_code=1,
+            stdout="",
+            stderr="Error: resource already managed by Terraform",
+            outputs={},
+        )
+
+    with caplog.at_level("INFO", logger="terraformer.terraform"), \
+         patch.object(runner, "_spawn_once", AsyncMock(side_effect=_fake_spawn_once)), \
+         patch.object(runner, "_platform_resources_extra_env", lambda: {}):
+        await runner._import_preexisting_platform_resources(workdir, "tst")
+
+    import_calls = [c for c in calls if c[0] == "import"]
+    assert len(import_calls) == len(runner_mod._platform_resources_import_entries("tst"))
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+    assert any(r.levelname == "INFO" and "already managed" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -4313,3 +4852,43 @@ async def test_reconcile_platform_resources_attempts_import_before_apply(
         await runner.reconcile_platform_resources(PlatformResourcesInputs(env="tst"))
 
     assert called["import"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_platform_resources_wipes_tfvars_when_import_raises(
+    tmp_path: Path,
+) -> None:
+    """Both import calls used to run OUTSIDE the try/finally that wipes
+    tfvars (`:2158` vs `:2159-2176` pre-fix) — a raise there would leave
+    this workspace's terraform.tfvars.json on disk. The import call is
+    now INSIDE the try, so the finally still wipes it even when import
+    itself raises."""
+    settings = Settings(
+        terraform_workdir_root=tmp_path / "wd",
+        terraform_modules_root=tmp_path / "modules",
+        terraform_standalone_root=tmp_path / "standalone",
+        terraform_binary="/bin/true",
+    )
+    standalone_src = settings.terraform_standalone_root / "platform-resources-apply"
+    standalone_src.mkdir(parents=True)
+    (standalone_src / "main.tf").write_text("# stub\n")
+    settings.terraform_workdir_root.mkdir(parents=True)
+    runner = TerraformRunner(settings)
+
+    async def _fake_import(workdir, env):  # noqa: ARG001
+        raise TerraformError(
+            "import", TerraformResult(exit_code=1, stdout="", stderr="boom", outputs={}),
+        )
+
+    ok = TerraformResult(exit_code=0, stdout="{}", stderr="", outputs={})
+
+    with patch.object(
+        runner, "_import_preexisting_platform_resources", AsyncMock(side_effect=_fake_import)
+    ), patch.object(runner, "_spawn", AsyncMock(return_value=ok)), \
+       patch.object(runner, "_output_json", AsyncMock(return_value={})), \
+       patch.object(runner, "_platform_resources_extra_env", lambda: {}):
+        with pytest.raises(TerraformError):
+            await runner.reconcile_platform_resources(PlatformResourcesInputs(env="tst"))
+
+    workdir = settings.terraform_workdir_root / "_platform_resources" / "tst"
+    assert not (workdir / "terraform.tfvars.json").exists()
