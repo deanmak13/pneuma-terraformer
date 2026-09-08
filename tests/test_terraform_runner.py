@@ -4458,8 +4458,30 @@ class _FakeTerraform:
             runner_mod._ImportOutcome.NOT_FOUND,
         ),
         (
-            "No secret found at pneuma/infra/inter-service-hmac/brain-brain",
+            # #32 round-3 Minor 2 (the `(42704)` row): classified by the
+            # `pq:` row alone now — the dedicated `(42704)` row is gone
+            # (curl-verified against lib/pq@v1.10.9 error.go:452-454:
+            # `Error()` never appends a SQLSTATE code, parenthesised or
+            # otherwise, to any `pq:`-prefixed text). Any `(SQLSTATE ...)`
+            # suffix, real or not, is irrelevant to this row's match.
+            # NOTE: this fixture still carries `pq:`, so it does NOT
+            # isolate the deletion (the `pq:` row matches it with or
+            # without the dropped row) — see the `pq:`-free case below
+            # for the actual RED proof.
+            'pq: role "activepieces_app" does not exist (SQLSTATE 42704)',
             runner_mod._ImportOutcome.NOT_FOUND,
+        ),
+        (
+            # Round-1 review Important 1 — the actual isolating RED proof
+            # for the dropped `(42704)` row's deletion: this text carries
+            # the SQLSTATE-shaped `(42704)` code WITHOUT the `pq:` phrase,
+            # so the surviving `pq:` row's regex (which requires a literal
+            # `pq:` prefix) cannot match it either. Pre-fix (with the
+            # `(42704)` row still registered) this text was NOT_FOUND;
+            # post-fix, with no row left to match it, it is UNCLASSIFIED
+            # (LAW: unknown is not benign).
+            "Error: importing role failed (42704)",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
         ),
         (
             "Error: NoSuchBucket: The specified bucket does not exist",
@@ -4550,11 +4572,28 @@ class _FakeTerraform:
             # dropped, not registered. The real vault text is `secret (%s)
             # not found, removing from state`
             # (hashicorp/terraform-provider-vault@v4.8.0
-            # vault/resource_kv_secret_v2.go:281-283), which this bare
+            # vault/resource_kv_secret_v2.go:281-284), which this bare
             # substring never matches, and even that real text can never
             # reach `terraform import` output for `vault_kv_secret_v2` (see
             # the round-2 provenance paragraph's drop rationale).
             "Error: secret not found",
+            runner_mod._ImportOutcome.UNCLASSIFIED,
+        ),
+        (
+            # #32 round-3 Minor 1 (the `no secret found at` row): dropped
+            # — was registered with source "hashicorp/vault provider
+            # (KV-v2 read) — platform-resources path" (no file:line, and
+            # unsourced: no code in vault/resource_kv_secret_v2.go emits
+            # this text in any form). The round-2 provenance paragraph
+            # above already established the real mechanism —
+            # `vault_kv_secret_v2` uses the identical passthrough Importer
+            # as postgresql_role/rabbitmq_vhost, so its genuine not-found
+            # (kvSecretV2Read's `secret == nil` branch, :281-284) swallows
+            # to `d.SetId(""); return nil` with no error text, landing on
+            # the terraform-core row above instead. Pre-fix (with the
+            # dropped row still registered) this text was NOT_FOUND — this
+            # is the RED proof for the deletion.
+            "No secret found at pneuma/infra/inter-service-hmac/brain-brain",
             runner_mod._ImportOutcome.UNCLASSIFIED,
         ),
         (
@@ -4633,13 +4672,50 @@ def test_platform_resources_import_entries_cover_every_hmac_pair() -> None:
 
 
 def test_platform_resources_hmac_import_id_matches_vault_kv_convention() -> None:
+    """hashicorp/terraform-provider-vault@v4.8.0's `vault_kv_secret_v2`
+    Read path (`kvSecretV2Read`) parses mount/name back OUT of `d.Id()`
+    via a regex that REQUIRES a literal `/data/` segment
+    (`kvV2SecretMountFromPathRegex = "^(.+?)/data/.+$"`, resource_kv_
+    secret_v2.go:24) — see `_kv_v2_import_id`'s docstring for the full
+    provenance trail. Live TST evidence (Job `psr-tf32-2314`,
+    2026-09-07T23:14Z): the OLD bare `pneuma/infra/inter-service-hmac/
+    brain-brain` form failed `Error: unable to read mount from ID
+    pneuma/infra/inter-service-hmac/brain-brain, err=no mount found`."""
     entries = runner_mod._platform_resources_import_entries("tst")
     prefix = _EXPECTED_PLATFORM_RESOURCES_MODULE_ADDRESS
     entry = next(
         e for e in entries
         if e.resource_address == f'{prefix}.vault_kv_secret_v2.inter_service_hmac["brain-brain"]'
     )
-    assert entry.resource_id == "pneuma/infra/inter-service-hmac/brain-brain"
+    assert entry.resource_id == "pneuma/data/infra/inter-service-hmac/brain-brain"
+
+
+_HMAC_RESOURCE_ID_RE = re.compile(r"^pneuma/data/infra/inter-service-hmac/[^/]+$")
+
+
+def test_platform_resources_every_hmac_import_id_uses_data_form() -> None:
+    """Design-for-N recurrence guard: every `vault_kv_secret_v2.inter_
+    service_hmac[...]` entry's `resource_id` — not just the single
+    "brain-brain" pair the live TST failure surfaced — must be the
+    provider's `<mount>/data/<name>` form, and none may regress to the
+    old bare `<mount>/<name>` shape that produced the live `no mount
+    found` failure. RED on `origin/main` 1e85c06 (cp-swap proof): every
+    hmac `resource_id` there is `pneuma/infra/inter-service-hmac/<pair>`
+    — no `/data/` segment — so both assertions below fail."""
+    entries = runner_mod._platform_resources_import_entries("tst")
+    hmac_ids = [
+        e.resource_id for e in entries if e.module_address.startswith("vault_kv_secret_v2.")
+    ]
+    assert len(hmac_ids) == len(runner_mod._INTER_SERVICE_HMAC_PAIRS)
+    for resource_id in hmac_ids:
+        assert _HMAC_RESOURCE_ID_RE.match(resource_id), resource_id
+        assert not resource_id.startswith("pneuma/infra/"), resource_id
+
+
+def test_kv_v2_import_id_helper() -> None:
+    """Unit test for the ONE derivation (`_kv_v2_import_id`, design for
+    N) every hmac entry's `resource_id` is built through."""
+    assert runner_mod._kv_v2_import_id("pneuma", "infra/x/y") == "pneuma/data/infra/x/y"
 
 
 @pytest.mark.asyncio
